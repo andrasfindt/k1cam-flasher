@@ -9,9 +9,9 @@ use job::{Event, Job};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{channel, Receiver};
+use std::sync::mpsc::{channel, Receiver, TryRecvError};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 const FLASH_SIZE: usize = 8 * 1024 * 1024;
 
@@ -36,9 +36,35 @@ struct App {
     verify: bool,
     reboot_after: bool,
     confirm: bool,
-    bundle: Option<PathBuf>,
+    bundle: Option<Loaded>,
     reboot_trial: bool,
     live_dump: bool,
+    cam_info: Option<Result<String, String>>,
+    info_rx: Option<Receiver<Result<String, String>>>,
+    info_tried: Instant,
+}
+
+/// A chosen .upd, read and checked when chosen and again whenever the file changes.
+struct Loaded {
+    path: PathBuf,
+    modified: Option<SystemTime>,
+    bundle: Result<Arc<bundle::Bundle>, String>,
+}
+
+impl Loaded {
+    fn load(path: PathBuf) -> Self {
+        let meta = std::fs::metadata(&path);
+        let modified = meta.as_ref().ok().and_then(|m| m.modified().ok());
+        let bundle = match meta {
+            Ok(m) if m.len() > FLASH_SIZE as u64 => Err("too large to be a k1cam update bundle".into()),
+            _ => std::fs::read(&path).map_err(|e| e.to_string()).and_then(bundle::parse).map(Arc::new),
+        };
+        Self { path, modified, bundle }
+    }
+
+    fn changed(&self) -> bool {
+        std::fs::metadata(&self.path).and_then(|m| m.modified()).ok() != self.modified
+    }
 }
 
 impl App {
@@ -60,6 +86,9 @@ impl App {
             bundle: None,
             reboot_trial: true,
             live_dump: false,
+            cam_info: None,
+            info_rx: None,
+            info_tried: Instant::now(),
         }
     }
 
@@ -102,6 +131,38 @@ impl App {
         if done {
             self.rx = None;
             self.progress = 0.0;
+            // A job may have changed what the camera reports.
+            self.cam_info = None;
+        }
+    }
+
+    /// Keeps the camera's info record current: read when it appears, after each
+    /// job, and again every few seconds while reading fails.
+    fn poll_camera_info(&mut self) {
+        if let Some(rx) = &self.info_rx {
+            match rx.try_recv() {
+                Ok(r) => {
+                    self.info_rx = None;
+                    if self.camera_up {
+                        self.cam_info = Some(r);
+                    }
+                }
+                Err(TryRecvError::Empty) => return,
+                Err(TryRecvError::Disconnected) => self.info_rx = None,
+            }
+        }
+        let stale = match &self.cam_info {
+            None => true,
+            Some(Err(_)) => self.info_tried.elapsed() > Duration::from_secs(3),
+            Some(Ok(_)) => false,
+        };
+        if self.camera_up && stale && !self.busy() {
+            let (tx, rx) = channel();
+            self.info_rx = Some(rx);
+            self.info_tried = Instant::now();
+            std::thread::spawn(move || {
+                let _ = tx.send(xu::Camera::open().and_then(|mut c| c.info()));
+            });
         }
     }
 
@@ -163,11 +224,21 @@ impl App {
             ui.colored_label(egui::Color32::YELLOW, "Not available on Windows yet; use Linux or macOS.");
         } else if self.camera_up {
             ui.colored_label(egui::Color32::LIGHT_GREEN, "k1cam camera detected");
+            match &self.cam_info {
+                None => {
+                    ui.label("Reading the camera's firmware info...");
+                }
+                Some(Err(e)) => {
+                    ui.colored_label(egui::Color32::YELLOW, format!("Could not read the camera's firmware info: {e}"));
+                }
+                Some(Ok(info)) => camera_fields(ui, info),
+            }
         } else {
             ui.colored_label(egui::Color32::LIGHT_RED, "No k1cam camera detected");
         }
         ui.separator();
-        let idle = !self.busy() && self.camera_up && !cfg!(windows);
+        // Not while the info record is being read: one exchange at a time.
+        let idle = !self.busy() && self.info_rx.is_none() && self.camera_up && !cfg!(windows);
         ui.horizontal(|ui| {
             if ui.add_enabled(idle, egui::Button::new("Camera info")).clicked() {
                 self.start("Info", |j| {
@@ -189,22 +260,42 @@ impl App {
             ui.checkbox(&mut self.live_dump, "live (diagnostic, may be inconsistent)");
         });
         ui.separator();
-        ui.horizontal(|ui| {
+        // Wrapped, so a long path can't push the button out of the window.
+        ui.horizontal_wrapped(|ui| {
             ui.label(match &self.bundle {
-                Some(p) => p.display().to_string(),
+                Some(l) => l.path.display().to_string(),
                 None => "no bundle selected (k1cam.upd)".into(),
             });
             if ui.button("Choose bundle...").clicked() {
-                self.bundle = rfd::FileDialog::new().add_filter("k1cam update", &["upd"]).pick_file();
+                if let Some(p) = rfd::FileDialog::new().add_filter("k1cam update", &["upd"]).pick_file() {
+                    self.bundle = Some(Loaded::load(p));
+                }
             }
         });
+        // What is shown is what gets installed.
+        let ready = match self.bundle.as_ref().map(|l| &l.bundle) {
+            Some(Ok(b)) => {
+                bundle_fields(ui, b);
+                if let Some(Ok(info)) = &self.cam_info {
+                    match xu::install_slot(info, b) {
+                        Ok(slot) => ui.colored_label(egui::Color32::LIGHT_GREEN, format!("The camera can install this into slot {slot}")),
+                        Err(e) => ui.colored_label(egui::Color32::YELLOW, e),
+                    };
+                }
+                Some(b.clone())
+            }
+            Some(Err(e)) => {
+                ui.colored_label(egui::Color32::LIGHT_RED, e);
+                None
+            }
+            None => None,
+        };
         ui.checkbox(&mut self.reboot_trial, "Reboot into the new slot when staged");
         ui.horizontal(|ui| {
-            if ui.add_enabled(idle && self.bundle.is_some(), egui::Button::new("Install to the inactive slot")).clicked() {
-                let path = self.bundle.clone().unwrap();
+            if ui.add_enabled(idle && ready.is_some(), egui::Button::new("Install to the inactive slot")).clicked() {
+                let b = ready.unwrap();
                 let reboot = self.reboot_trial;
                 self.start("A/B update", move |j| {
-                    let b = bundle::parse(std::fs::read(&path).map_err(|e| e.to_string())?)?;
                     j.log(format!("Bundle {} ({} bytes)", b.build, b.data.len()));
                     xu::Camera::open()?.upgrade(j, &b, reboot)
                 });
@@ -232,6 +323,56 @@ impl App {
             ui.separator();
             ui.label("Linux: install the udev rule from the README. Windows: bind WinUSB to a108:c309 with Zadig. macOS: no driver needed.");
         });
+    }
+}
+
+fn fields(ui: &mut egui::Ui, id: &str, rows: &[(&str, String)]) {
+    egui::Grid::new(id).num_columns(2).spacing([16.0, 2.0]).show(ui, |ui| {
+        for (k, v) in rows {
+            ui.label(*k);
+            ui.monospace(v.as_str());
+            ui.end_row();
+        }
+    });
+}
+
+fn camera_fields(ui: &mut egui::Ui, info: &str) {
+    let get = |k| xu::record_value(info, k).unwrap_or("");
+    let slot = |k| match get(k) {
+        "" => "none",
+        s => s,
+    };
+    fields(
+        ui,
+        "camera",
+        &[
+            ("Build", get("build").into()),
+            ("Kernel", get("kernel").into()),
+            ("Slots", format!("running {}, confirmed {}, trial {}", slot("running_slot"), slot("active_slot"), slot("trial_slot"))),
+            ("Boot", format!("{}, boot compat {}", get("boot"), get("boot_compat"))),
+            ("Layout", get("layout").into()),
+        ],
+    );
+}
+
+fn bundle_fields(ui: &mut egui::Ui, b: &bundle::Bundle) {
+    let mut rows = vec![("Build", b.build.clone())];
+    for (label, key) in [("Commit", "COMMIT_ID"), ("Kernel", "KERNEL_COMMIT"), ("Buildroot", "BUILDROOT_VERSION")] {
+        if let Some(v) = b.release_value(key) {
+            rows.push((label, v.into()));
+        }
+    }
+    rows.push(("Board", format!("{}, layout {}", b.board, b.layout)));
+    rows.push(("Needs", format!("boot compat {}", b.min_boot)));
+    rows.push(("Size", format!("kernel {} KiB, rootfs {} KiB", b.kernel_len.div_ceil(1024), b.rootfs_len.div_ceil(1024))));
+    fields(ui, "bundle", &rows);
+    match &b.release {
+        Some(text) => {
+            egui::CollapsingHeader::new("os-release").show(ui, |ui| ui.monospace(text.trim_end()));
+        }
+        None => {
+            ui.label("This file has no release information (packed by an older k1cam-mkupd).");
+        }
     }
 }
 
@@ -280,8 +421,16 @@ impl eframe::App for App {
         if !self.busy() && self.last_poll.elapsed() > Duration::from_secs(1) {
             self.cloner_up = cloner::device_present();
             self.camera_up = xu::Camera::present();
+            if !self.camera_up {
+                self.cam_info = None;
+            }
+            if let Some(path) = self.bundle.as_ref().filter(|l| l.changed()).map(|l| l.path.clone()) {
+                self.log.push(format!("{} changed on disk, reloaded", path.display()));
+                self.bundle = Some(Loaded::load(path));
+            }
             self.last_poll = Instant::now();
         }
+        self.poll_camera_info();
         ctx.request_repaint_after(Duration::from_millis(250));
 
         egui::Panel::bottom("log").resizable(true).min_size(140.0).show(ui, |ui| {
@@ -308,7 +457,9 @@ impl eframe::App for App {
             ui.separator();
             match self.tab {
                 Tab::Cloner => self.cloner_tab(ui),
-                Tab::Update => self.update_tab(ui),
+                Tab::Update => {
+                    egui::ScrollArea::vertical().show(ui, |ui| self.update_tab(ui));
+                }
                 Tab::Help => self.help_tab(ui),
             }
         });
@@ -333,10 +484,16 @@ fn main() -> eframe::Result {
         Box::new(|cc| {
             egui_extras::install_image_loaders(&cc.egui_ctx);
             let mut app = App::new();
-            match std::env::args().nth(1).as_deref() {
-                Some("--tab=update") => app.tab = Tab::Update,
-                Some("--tab=help") => app.tab = Tab::Help,
-                _ => {}
+            for arg in std::env::args().skip(1) {
+                match arg.as_str() {
+                    "--tab=update" => app.tab = Tab::Update,
+                    "--tab=help" => app.tab = Tab::Help,
+                    path if path.ends_with(".upd") => {
+                        app.tab = Tab::Update;
+                        app.bundle = Some(Loaded::load(path.into()));
+                    }
+                    _ => {}
+                }
             }
             Ok(Box::new(app))
         }),

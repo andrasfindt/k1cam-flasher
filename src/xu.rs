@@ -470,26 +470,7 @@ impl Camera {
     pub fn upgrade(&mut self, job: &Job, b: &Bundle, reboot: bool) -> R<String> {
         let info = self.info()?;
         let get = |k| record_value(&info, k).unwrap_or("");
-        if get("layout") != crate::bundle::LAYOUT {
-            return Err(format!(
-                "the camera's flash layout is {:?}: flash k1cam.bin once with the cloner, then update with bundles",
-                get("layout")
-            ));
-        }
-        if b.min_boot > get("boot_compat").parse().unwrap_or(0) {
-            return Err("this bundle needs a newer bootloader than the camera has".into());
-        }
-        if !get("features").contains("upgrade") {
-            return Err(format!(
-                "the camera cannot update now (boot: {}, trial slot: {}); let a pending trial confirm or cancel it first",
-                get("boot"),
-                get("trial_slot")
-            ));
-        }
-        if get("build") == b.build {
-            return Err(format!("the camera already runs {}", b.build));
-        }
-        let target = if get("active_slot") == "a" { "b" } else { "a" };
+        let target = install_slot(&info, b)?;
         let serial = get("serial").to_string();
         job.log(format!("Installing {} into slot {target} (camera runs {})", b.build, get("build")));
 
@@ -573,6 +554,34 @@ impl Camera {
     pub fn cancel_trial(&mut self) -> R<()> {
         self.command_ok("cancel", OP_ABORT, 1, 0, 0)
     }
+}
+
+/// The slot a camera with this info record would install b into, or why it would refuse.
+pub fn install_slot(info: &str, b: &Bundle) -> R<&'static str> {
+    let get = |k| record_value(info, k).unwrap_or("");
+    if get("layout") != crate::bundle::LAYOUT {
+        return Err(format!(
+            "the camera's flash layout is {:?}: flash k1cam.bin once with the cloner, then update with bundles",
+            get("layout")
+        ));
+    }
+    if get("board") != b.board {
+        return Err(format!("this bundle is for board {}, the camera is {}", b.board, get("board")));
+    }
+    if b.min_boot > get("boot_compat").parse().unwrap_or(0) {
+        return Err("this bundle needs a newer bootloader than the camera has".into());
+    }
+    if !get("features").contains("upgrade") {
+        return Err(format!(
+            "the camera cannot update now (boot: {}, trial slot: {}); let a pending trial confirm or cancel it first",
+            get("boot"),
+            get("trial_slot")
+        ));
+    }
+    if get("build") == b.build {
+        return Err(format!("the camera already runs {}", b.build));
+    }
+    Ok(if get("active_slot") == "a" { "b" } else { "a" })
 }
 
 pub fn hex(b: &[u8]) -> String {

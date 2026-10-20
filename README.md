@@ -3,7 +3,7 @@
 A small, single-binary GUI to back up, flash and update the Creality K1 camera (Ingenic T31L, 8 MiB SPI NOR) on Linux, Windows and macOS.
 
 - **Backup & Flash (cloner)**: full read and full flash through the Ingenic USB bootrom cloner protocol, ported from [thingino-dfu](https://github.com/gtxaspec/thingino-dfu) (T31 family only), with read-back verification.
-- **A/B Update (k1cam)**: dump, update the inactive slot, reboot into the trial or cancel it, over the k1cam UVC extension unit protocol (same as `uvcdctl firmware`). On Linux it uses the uvcvideo XU ioctl on `/dev/videoN` (needs access to the video node, e.g. the `video` group); on macOS it uses libusb (untested). Not available on Windows. `k1cam-flasher --info` prints the camera info on the command line.
+- **A/B Update (k1cam)**: dump, update the inactive slot, reboot into the trial or cancel it, over the k1cam UVC extension unit protocol (same as `uvcdctl firmware`). On Linux it uses the uvcvideo XU ioctl on `/dev/videoN` (needs access to the video node, e.g. the `video` group); on macOS it uses libusb (untested). Not available on Windows. The tab shows what the connected camera runs (build, kernel commit, slots, boot state) and what the chosen `k1cam.upd` holds (build, commit, kernel, sizes and its os-release, after checking its digests), and whether the camera would take it. `k1cam-flasher --info` prints the camera info on the command line; `k1cam-flasher FILE.upd` opens the A/B tab with that bundle.
 - **Short NOR pins**: built-in instructions for forcing cloner mode (see below).
 
 | Backup & Flash | A/B Update | Short NOR pins |
@@ -43,6 +43,7 @@ for the rationale and collision checks.
 
 - Backup: *Detect flash chip* checks the link, *Backup flash...* saves the 8 MiB image and shows its SHA-256.
 - Flash: choose `k1cam.bin` (exactly 8 MiB), optionally back up first, tick the confirmation, press *Flash*. This replaces U-Boot and installs the A/B layout once. After that, update with `k1cam.upd` on the A/B tab.
+- Update: choose `k1cam.upd` and compare it with what the camera runs; the bundle is read again when the file changes on disk, and what is shown is what gets installed. The camera is sent the bundle only, not the release information after it, so cameras on firmware from before that section was added take these files too.
 
 ## Build
 
@@ -58,6 +59,6 @@ Mixed, per file (SPDX identifiers in the sources, texts in `LICENSES/`):
 
 - **MIT**: the GUI, the k1cam A/B protocol client, the bundle parser, udev rule and build files.
 - **GPL-2.0-only**: `src/cloner/` and `tools/gen-cloner-data/`, which are derived from [thingino-dfu](https://github.com/gtxaspec/thingino-dfu), and the embedded burner SPL/U-Boot and generated blobs in `src/cloner/data/` (GPL U-Boot, thingino-dfu output).
-- **CC0-1.0** (public domain): the photo `docs/short-nor-pins.jpg` and this documentation.
+- **CC0-1.0** (public domain): the photo `docs/short-nor-pins.jpg`, the synthetic test bundle `tests/data/golden.upd` and this documentation.
 
 The built binary links the GPL-2.0-only code, so it as a whole is distributed under GPL-2.0-only; the source for it is this repository.
