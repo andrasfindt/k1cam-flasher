@@ -5,17 +5,25 @@ edition = "2021"
 description = "Small cross-platform GUI to back up, flash and A/B-update the Creality K1 camera (Ingenic T31L) via the cloner and k1cam protocols"
 license = "GPL-2.0-only"
 
+[features]
+default = ["gui"]
+# Without it: the headless command-line flasher only (see the README's static builds).
+gui = ["dep:eframe", "dep:egui_extras", "dep:image", "dep:rfd"]
+
 [dependencies]
-rusb = { version = "0.9", features = ["vendored"] }
-eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts", "x11", "wayland"] }
-egui_extras = { version = "0.37", features = ["image"] }
-image = { version = "0.25", default-features = false, features = ["jpeg"] }
 sha2 = "0.10"
 crc32fast = "1"
-rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "async-std"] }
+eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts", "x11", "wayland"], optional = true }
+egui_extras = { version = "0.37", features = ["image"], optional = true }
+image = { version = "0.25", default-features = false, features = ["jpeg"], optional = true }
+rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "async-std"], optional = true }
 
-[target.'cfg(target_os = "linux")'.dependencies]
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# Linux uses usbfs and V4L2 directly; libusb is only needed elsewhere.
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+rusb = { version = "0.9", features = ["vendored"] }
 
 
 [profile.release]

@@ -1,0 +1,10 @@
+# Static builds of the headless flasher (see the README) link with the lld that
+# ships with Rust, so ARM targets need no C cross toolchain.
+[target.aarch64-unknown-linux-musl]
+linker = "rust-lld"
+
+[target.armv7-unknown-linux-musleabihf]
+linker = "rust-lld"
+
+[target.arm-unknown-linux-musleabihf]
+linker = "rust-lld"

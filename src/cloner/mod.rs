@@ -4,7 +4,7 @@
 //! supported; the K1 camera is a T31L.
 
 use crate::job::Job;
-use rusb::{DeviceHandle, GlobalContext};
+use crate::usb::Device;
 use std::time::{Duration, Instant};
 
 mod chips;
@@ -47,21 +47,16 @@ fn ms(n: u64) {
     std::thread::sleep(Duration::from_millis(n));
 }
 
-fn usb<T>(what: &str, r: rusb::Result<T>) -> R<T> {
+fn usb<T>(what: &str, r: R<T>) -> R<T> {
     r.map_err(|e| format!("{what}: {e}"))
 }
 
 pub fn device_present() -> bool {
-    rusb::devices()
-        .map(|l| {
-            l.iter()
-                .any(|d| d.device_descriptor().map(|x| x.vendor_id() == VID && x.product_id() == PID).unwrap_or(false))
-        })
-        .unwrap_or(false)
+    crate::usb::present(&[(VID, PID)])
 }
 
 pub struct Cloner<'a> {
-    h: DeviceHandle<GlobalContext>,
+    h: Device,
     job: &'a Job,
 }
 
@@ -74,15 +69,8 @@ pub struct ChipInfo {
 
 impl<'a> Cloner<'a> {
     pub fn open(job: &'a Job) -> R<Self> {
-        let h = usb(
-            "open a108:c309 (is the driver/udev rule installed? see README)",
-            rusb::open_device_with_vid_pid(VID, PID).ok_or(rusb::Error::NoDevice),
-        )?;
-        let _ = h.set_auto_detach_kernel_driver(true);
-        if h.active_configuration().ok() != Some(1) {
-            let _ = h.set_active_configuration(1);
-        }
-        usb("claim interface 0", h.claim_interface(0))?;
+        let h = usb("open a108:c309 (is the driver/udev rule installed? see README)", Device::open(VID, PID))?;
+        usb("claim interface 0", h.claim(0))?;
         Ok(Self { h, job })
     }
 
@@ -101,7 +89,7 @@ impl<'a> Cloner<'a> {
     fn vout(&self, req: u8, value: u16, index: u16, data: &[u8]) -> R<()> {
         usb(
             &format!("vendor request 0x{req:02x}"),
-            self.h.write_control(REQ_OUT, req, value, index, data, Duration::from_secs(5)),
+            self.h.control_out(REQ_OUT, req, value, index, data, Duration::from_secs(5)),
         )?;
         Ok(())
     }
@@ -109,7 +97,7 @@ impl<'a> Cloner<'a> {
     fn vin(&self, req: u8, buf: &mut [u8], timeout: u64) -> R<usize> {
         usb(
             &format!("vendor request 0x{req:02x}"),
-            self.h.read_control(REQ_IN, req, 0, 0, buf, Duration::from_millis(timeout)),
+            self.h.control_in(REQ_IN, req, 0, 0, buf, Duration::from_millis(timeout)),
         )
     }
 
@@ -122,7 +110,7 @@ impl<'a> Cloner<'a> {
     fn bulk_out(&self, data: &[u8], timeout: Duration) -> R<()> {
         let mut off = 0;
         while off < data.len() {
-            let n = usb("bulk write", self.h.write_bulk(EP_OUT, &data[off..], timeout))?;
+            let n = usb("bulk write", self.h.bulk_out(EP_OUT, &data[off..], timeout))?;
             if n == 0 {
                 return Err("bulk write: no progress".into());
             }
@@ -135,7 +123,7 @@ impl<'a> Cloner<'a> {
         let mut out = vec![0u8; len];
         let mut off = 0;
         while off < len {
-            let n = usb("bulk read", self.h.read_bulk(EP_IN, &mut out[off..], timeout))?;
+            let n = usb("bulk read", self.h.bulk_in(EP_IN, &mut out[off..], timeout))?;
             if n == 0 {
                 return Err("bulk read: no progress".into());
             }
@@ -274,7 +262,7 @@ impl<'a> Cloner<'a> {
             ms(2000);
             // The device may re-enumerate; reopen the handle.
             let job = self.job;
-            let _ = self.h.release_interface(0);
+            self.h.release(0);
             let new = Self::reopen(job, 15)?;
             let old = std::mem::replace(self, new);
             drop(old);
@@ -406,12 +394,12 @@ impl<'a> Cloner<'a> {
         let mut last = 0;
         for _ in 0..3 {
             // The burner may not answer this request; the reference tolerates that.
-            let _ = self.h.write_control(REQ_OUT, VR_WRITE, 0, 0, &hs, Duration::from_secs(5));
+            let _ = self.h.control_out(REQ_OUT, VR_WRITE, 0, 0, &hs, Duration::from_secs(5));
             ms(10);
             self.bulk_out(data, Duration::from_secs(6))?;
             ms(200);
             let mut sink = [0u8; 512];
-            let _ = self.h.read_bulk(EP_IN, &mut sink, Duration::from_millis(5));
+            let _ = self.h.bulk_in(EP_IN, &mut sink, Duration::from_millis(5));
             ms(350);
             let t0 = Instant::now();
             loop {

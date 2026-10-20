@@ -29,6 +29,7 @@ pub struct Bundle {
 
 impl Bundle {
     /// An os-release field, unquoted.
+    #[cfg(any(feature = "gui", test))]
     pub fn release_value(&self, key: &str) -> Option<&str> {
         let v = crate::xu::record_value(self.release.as_deref()?, key)?;
         Some(v.strip_prefix('"').and_then(|v| v.strip_suffix('"')).unwrap_or(v))
@@ -63,6 +64,15 @@ fn release_info(file: &[u8], end: usize) -> Result<String, String> {
         return Err("the release information is not 1 to 4096 bytes of printable text".into());
     }
     Ok(String::from_utf8_lossy(text).into_owned())
+}
+
+/// Reads and checks a .upd file (refusing anything too big to be one first).
+pub fn load(path: &std::path::Path) -> Result<Bundle, String> {
+    let meta = std::fs::metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    if meta.len() > crate::ops::FLASH_SIZE as u64 {
+        return Err(format!("{}: too large to be a k1cam update bundle", path.display()));
+    }
+    parse(std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?)
 }
 
 pub fn parse(mut data: Vec<u8>) -> Result<Bundle, String> {

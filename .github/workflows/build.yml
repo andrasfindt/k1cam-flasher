@@ -16,3 +16,19 @@ jobs:
           path: |
             target/release/k1cam-flasher
             target/release/k1cam-flasher.exe
+  # The command-line flasher, statically linked for small Linux boards.
+  headless:
+    strategy:
+      matrix:
+        target: [x86_64-unknown-linux-musl, aarch64-unknown-linux-musl, armv7-unknown-linux-musleabihf]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup target add ${{ matrix.target }}
+      - run: cargo test --release --no-default-features
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+      - run: cargo build --release --no-default-features --target ${{ matrix.target }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: k1cam-flasher-headless-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/k1cam-flasher

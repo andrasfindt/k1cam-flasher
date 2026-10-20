@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
 //! k1cam firmware protocol over the UVC Extension Unit (same as `uvcdctl firmware`).
-//! Control transfers go straight to the camera with libusb. Windows binds the UVC
-//! interface to usbvideo, which libusb cannot reach, so it is not supported there.
+//! Linux uses uvcvideo's XU ioctl; macOS sends the control transfers with libusb.
+//! Windows binds the UVC interface to usbvideo, which libusb cannot reach, so it
+//! is not supported there.
 
 use crate::bundle::Bundle;
 use crate::job::Job;
@@ -11,12 +12,13 @@ use std::time::{Duration, Instant};
 #[cfg(all(not(windows), not(target_os = "linux")))]
 use rusb::{DeviceHandle, GlobalContext};
 
+#[cfg(all(test, target_os = "linux"))]
+pub use v4l::UVCIOC_CTRL_QUERY;
+
 /// On Linux uvcvideo owns the control interface, so raw libusb control transfers
 /// are refused (EBUSY). The driver's own XU ioctl on /dev/videoN is used instead.
 #[cfg(target_os = "linux")]
 mod v4l {
-    use std::os::fd::AsRawFd;
-
     #[repr(C)]
     struct Query {
         unit: u8,
@@ -26,18 +28,13 @@ mod v4l {
         data: *mut u8,
     }
 
-    const fn ioctl_code() -> libc::c_ulong {
-        (3 << 30) | ((std::mem::size_of::<Query>() as libc::c_ulong) << 16) | ((b'u' as libc::c_ulong) << 8) | 0x21
-    }
+    use crate::linux::{ioc, IOC_READ, IOC_WRITE};
+
+    pub const UVCIOC_CTRL_QUERY: u32 = ioc(IOC_READ | IOC_WRITE, b'u', 0x21, std::mem::size_of::<Query>());
 
     pub fn query(f: &std::fs::File, unit: u8, selector: u8, query: u8, data: &mut [u8]) -> std::io::Result<()> {
         let mut q = Query { unit, selector, query, size: data.len() as u16, data: data.as_mut_ptr() };
-        let r = unsafe { libc::ioctl(f.as_raw_fd(), ioctl_code() as _, &mut q as *mut Query) };
-        if r < 0 {
-            Err(std::io::Error::last_os_error())
-        } else {
-            Ok(())
-        }
+        crate::linux::ioctl(f, UVCIOC_CTRL_QUERY, &mut q).map(|_| ())
     }
 
     /// The uvcvideo node that answers a GET_LEN of 60 on the command selector.
@@ -72,8 +69,12 @@ const CAM_PID: u16 = 0x4b31;
 const LEGACY_CAM_VID: u16 = 0x1d6b;
 const LEGACY_CAM_PID: u16 = 0x0110;
 
+/// Every USB identity of a camera running k1cam firmware.
+pub const CAMERA_IDS: [(u16, u16); 2] = [(CAM_VID, CAM_PID), (LEGACY_CAM_VID, LEGACY_CAM_PID)];
+
+#[cfg(all(not(windows), not(target_os = "linux")))]
 fn camera_id(vid: u16, pid: u16) -> bool {
-    (vid == CAM_VID && pid == CAM_PID) || (vid == LEGACY_CAM_VID && pid == LEGACY_CAM_PID)
+    CAMERA_IDS.contains(&(vid, pid))
 }
 const UNIT: u16 = 4;
 const SEL_COMMAND: u16 = 26;
@@ -230,13 +231,7 @@ pub struct Camera {
 #[cfg(not(windows))]
 impl Camera {
     pub fn present() -> bool {
-        rusb::devices()
-            .map(|l| {
-                l.iter().any(|d| {
-                    d.device_descriptor().map(|x| camera_id(x.vendor_id(), x.product_id())).unwrap_or(false)
-                })
-            })
-            .unwrap_or(false)
+        crate::usb::present(&CAMERA_IDS)
     }
 
     #[cfg(target_os = "linux")]

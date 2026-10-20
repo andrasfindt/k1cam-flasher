@@ -1,9 +1,9 @@
 # k1cam-flasher
 
-A small, single-binary GUI to back up, flash and update the Creality K1 camera (Ingenic T31L, 8 MiB SPI NOR) on Linux, Windows and macOS.
+A small, single-binary GUI to back up, flash and update the Creality K1 camera (Ingenic T31L, 8 MiB SPI NOR) on Linux, Windows and macOS, and the same operations as a command line, which also builds as a small static binary for the Linux boards a camera gets plugged into (see [Command line](#command-line) and [Static builds](#static-builds)).
 
 - **Backup & Flash (cloner)**: full read and full flash through the Ingenic USB bootrom cloner protocol, ported from [thingino-dfu](https://github.com/gtxaspec/thingino-dfu) (T31 family only), with read-back verification.
-- **A/B Update (k1cam)**: dump, update the inactive slot, reboot into the trial or cancel it, over the k1cam UVC extension unit protocol (same as `uvcdctl firmware`). On Linux it uses the uvcvideo XU ioctl on `/dev/videoN` (needs access to the video node, e.g. the `video` group); on macOS it uses libusb (untested). Not available on Windows. The tab shows what the connected camera runs (build, kernel commit, slots, boot state) and what the chosen `k1cam.upd` holds (build, commit, kernel, sizes and its os-release, after checking its digests), and whether the camera would take it. `k1cam-flasher --info` prints the camera info on the command line; `k1cam-flasher FILE.upd` opens the A/B tab with that bundle.
+- **A/B Update (k1cam)**: dump, update the inactive slot, reboot into the trial or cancel it, over the k1cam UVC extension unit protocol (same as `uvcdctl firmware`). On Linux it uses the uvcvideo XU ioctl on `/dev/videoN` (needs access to the video node, e.g. the `video` group); on macOS it uses libusb (untested). Not available on Windows. The tab shows what the connected camera runs (build, kernel commit, slots, boot state) and what the chosen `k1cam.upd` holds (build, commit, kernel, sizes and its os-release, after checking its digests), and whether the camera would take it. `k1cam-flasher FILE.upd` opens the A/B tab with that bundle.
 - **Short NOR pins**: built-in instructions for forcing cloner mode (see below).
 
 | Backup & Flash | A/B Update | Short NOR pins |
@@ -35,7 +35,7 @@ ROM's cloner identity remains `a108:c309`. See the
 [firmware USB identity notes](https://github.com/itzexor/k1cam-firmware/blob/k1cam/USB-IDENTITY.md)
 for the rationale and collision checks.
 
-- **Linux**: `sudo cp udev/99-k1cam-flasher.rules /etc/udev/rules.d/ && sudo udevadm control --reload && sudo udevadm trigger`
+- **Linux**: `sudo cp udev/99-k1cam-flasher.rules /etc/udev/rules.d/ && sudo udevadm control --reload && sudo udevadm trigger`.
 - **Windows**: bind WinUSB to `a108:c309` with [Zadig](https://zadig.akeo.ie/) while the camera is in cloner mode.
 - **macOS**: nothing to install.
 
@@ -45,9 +45,38 @@ for the rationale and collision checks.
 - Flash: choose `k1cam.bin` (exactly 8 MiB), optionally back up first, tick the confirmation, press *Flash*. This replaces U-Boot and installs the A/B layout once. After that, update with `k1cam.upd` on the A/B tab.
 - Update: choose `k1cam.upd` and compare it with what the camera runs; the bundle is read again when the file changes on disk, and what is shown is what gets installed. The camera is sent the bundle only, not the release information after it, so cameras on firmware from before that section was added take these files too.
 
+## Command line
+
+Every operation also runs without the GUI; `k1cam-flasher help` lists them:
+
+```
+k1cam-flasher info                      # a running camera's firmware information
+k1cam-flasher update k1cam.upd          # install into the inactive slot, reboot into the trial
+k1cam-flasher reboot | cancel           # start or withdraw a staged trial
+k1cam-flasher dump backup.bin [--live]  # the whole flash from a running camera
+k1cam-flasher detect                    # cloner mode: identify the flash chip
+k1cam-flasher backup backup.bin         # cloner mode: read the whole flash
+k1cam-flasher flash k1cam.bin --yes     # cloner mode: replace the whole flash
+k1cam-flasher check k1cam.upd           # what a bundle holds, no camera needed
+```
+
+`flash` backs up next to the image, verifies and reboots unless told not to (`--no-backup`, `--no-verify`, `--no-reboot`); `update --no-reboot` only stages. Progress and messages go to stderr, results to stdout; the exit status is 0 on success, 1 on failure and 2 for usage errors. Output files are never overwritten. Ctrl-C stops an operation cleanly (a dump or upload ends its session on the camera); a second Ctrl-C quits at once.
+
+## Static builds
+
+Without the GUI (`--no-default-features`) the flasher is about 1 MiB and depends on nothing but Rust's standard library: on Linux it talks to usbfs and V4L2 itself instead of using libusb, so it links statically for musl targets with no C cross toolchain. `.cargo/config.toml` links the ARM targets with the `rust-lld` that ships with Rust.
+
+```
+rustup target add aarch64-unknown-linux-musl      # e.g. Raspberry Pi OS, 64-bit
+cargo build --release --no-default-features --target aarch64-unknown-linux-musl
+# -> target/aarch64-unknown-linux-musl/release/k1cam-flasher (static)
+```
+
+The same works for `x86_64-unknown-linux-musl` and `armv7-unknown-linux-musleabihf` (32-bit Raspberry Pi OS); CI builds all three. On the target it needs access to `/dev/video*` (A/B) and `/dev/bus/usb` (cloner), e.g. as root or with the udev rule. MIPS boards are a tier 3 Rust target: nightly Rust with `-Z build-std=std,panic_abort --target mipsel-unknown-linux-musl` and a musl cross gcc as the linker (untested).
+
 ## Build
 
-`cargo build --release` (needs a C toolchain; libusb is vendored). On Linux the build needs no extra GUI libraries beyond the usual X11/Wayland ones at runtime. CI in `.github/workflows/build.yml` builds all three OSes.
+`cargo build --release` builds the GUI. It needs a C toolchain (for a Wayland build script on Linux, and libusb, which is vendored, on Windows and macOS); on Linux the build needs no extra GUI libraries beyond the usual X11/Wayland ones at runtime. CI in `.github/workflows/build.yml` builds the GUI on all three OSes and the static command-line binaries.
 
 ## Embedded cloner data
 
@@ -57,7 +86,7 @@ for the rationale and collision checks.
 
 Mixed, per file (SPDX identifiers in the sources, texts in `LICENSES/`):
 
-- **MIT**: the GUI, the k1cam A/B protocol client, the bundle parser, udev rule and build files.
+- **MIT**: the GUI, the command line, the k1cam A/B protocol client, the bundle parser, the USB and Linux device layers (`src/usb.rs`, `src/linux.rs`), udev rule and build files.
 - **GPL-2.0-only**: `src/cloner/` and `tools/gen-cloner-data/`, which are derived from [thingino-dfu](https://github.com/gtxaspec/thingino-dfu), and the embedded burner SPL/U-Boot and generated blobs in `src/cloner/data/` (GPL U-Boot, thingino-dfu output).
 - **CC0-1.0** (public domain): the photo `docs/short-nor-pins.jpg`, the synthetic test bundle `tests/data/golden.upd` and this documentation.
 
