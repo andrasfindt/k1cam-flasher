@@ -27,6 +27,14 @@ The short only matters at power-up. If the device does not appear, power-cycle a
 
 ## Driver setup
 
+Running k1cam firmware uses `f055:4b31` (unofficial FOSS community VID,
+`4b31` = "K1"), manufacturer `k1cam`, product `K1 Camera`. This is a project
+convention, not an exclusive allocation. Earlier `1d6b:0110` firmware is
+also recognized so updates and rollback can cross the ID change. The boot
+ROM's cloner identity remains `a108:c309`. See the
+[firmware USB identity notes](https://github.com/itzexor/k1cam-firmware/blob/k1cam/USB-IDENTITY.md)
+for the rationale and collision checks.
+
 - **Linux**: `sudo cp udev/99-k1cam-flasher.rules /etc/udev/rules.d/ && sudo udevadm control --reload && sudo udevadm trigger`
 - **Windows**: bind WinUSB to `a108:c309` with [Zadig](https://zadig.akeo.ie/) while the camera is in cloner mode.
 - **macOS**: nothing to install.

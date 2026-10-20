@@ -65,8 +65,16 @@ mod v4l {
     }
 }
 
-const CAM_VID: u16 = 0x1d6b;
-const CAM_PID: u16 = 0x0110;
+// Unofficial FOSS VID and "K1" PID; retain the previous firmware identity
+// so an update can cross the change in either direction (including rollback).
+const CAM_VID: u16 = 0xf055;
+const CAM_PID: u16 = 0x4b31;
+const LEGACY_CAM_VID: u16 = 0x1d6b;
+const LEGACY_CAM_PID: u16 = 0x0110;
+
+fn camera_id(vid: u16, pid: u16) -> bool {
+    (vid == CAM_VID && pid == CAM_PID) || (vid == LEGACY_CAM_VID && pid == LEGACY_CAM_PID)
+}
 const UNIT: u16 = 4;
 const SEL_COMMAND: u16 = 26;
 const SEL_DATA: u16 = 27;
@@ -225,7 +233,7 @@ impl Camera {
         rusb::devices()
             .map(|l| {
                 l.iter().any(|d| {
-                    d.device_descriptor().map(|x| x.vendor_id() == CAM_VID && x.product_id() == CAM_PID).unwrap_or(false)
+                    d.device_descriptor().map(|x| camera_id(x.vendor_id(), x.product_id())).unwrap_or(false)
                 })
             })
             .unwrap_or(false)
@@ -242,9 +250,9 @@ impl Camera {
             .map_err(|e| e.to_string())?
             .iter()
             .find(|d| {
-                d.device_descriptor().map(|x| x.vendor_id() == CAM_VID && x.product_id() == CAM_PID).unwrap_or(false)
+                d.device_descriptor().map(|x| camera_id(x.vendor_id(), x.product_id())).unwrap_or(false)
             })
-            .ok_or("camera (1d6b:0110) not found; is it running the k1cam firmware?")?;
+            .ok_or("k1cam camera (f055:4b31 or legacy 1d6b:0110) not found; is it running the k1cam firmware?")?;
         let cfg = dev.active_config_descriptor().map_err(|e| e.to_string())?;
         let vc_if = cfg
             .interfaces()

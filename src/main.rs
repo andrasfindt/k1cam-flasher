@@ -162,7 +162,7 @@ impl App {
         if cfg!(windows) {
             ui.colored_label(egui::Color32::YELLOW, "Not available on Windows yet; use Linux or macOS.");
         } else if self.camera_up {
-            ui.colored_label(egui::Color32::LIGHT_GREEN, "Camera 1d6b:0110 detected");
+            ui.colored_label(egui::Color32::LIGHT_GREEN, "k1cam camera detected");
         } else {
             ui.colored_label(egui::Color32::LIGHT_RED, "No k1cam camera detected");
         }
