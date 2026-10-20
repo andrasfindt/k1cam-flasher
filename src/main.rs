@@ -3,6 +3,8 @@ mod bundle;
 mod cli;
 mod cloner;
 #[cfg(feature = "gui")]
+mod console;
+#[cfg(feature = "gui")]
 mod gui;
 mod job;
 #[cfg(target_os = "linux")]

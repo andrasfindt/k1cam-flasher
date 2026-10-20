@@ -69,7 +69,7 @@ const CAM_PID: u16 = 0x4b31;
 const LEGACY_CAM_VID: u16 = 0x1d6b;
 const LEGACY_CAM_PID: u16 = 0x0110;
 
-/// Every USB identity of a camera running k1cam firmware.
+/// Every USB identity of a camera running k1cam firmware (also its console's).
 pub const CAMERA_IDS: [(u16, u16); 2] = [(CAM_VID, CAM_PID), (LEGACY_CAM_VID, LEGACY_CAM_PID)];
 
 #[cfg(all(not(windows), not(target_os = "linux")))]

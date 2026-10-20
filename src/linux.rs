@@ -194,6 +194,26 @@ impl UsbDevice {
     }
 }
 
+/// Other processes that have this tty open, as "name (pid)".
+#[cfg(feature = "gui")]
+pub fn tty_users(path: &str) -> Vec<String> {
+    let Ok(want) = std::fs::canonicalize(path) else { return Vec::new() };
+    let me = std::process::id().to_string();
+    let mut users = Vec::new();
+    for p in std::fs::read_dir("/proc").into_iter().flatten().flatten() {
+        let pid = p.file_name().to_string_lossy().into_owned();
+        if pid == me || !pid.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        let Ok(fds) = std::fs::read_dir(p.path().join("fd")) else { continue };
+        if fds.flatten().any(|fd| std::fs::read_link(fd.path()).is_ok_and(|t| t == want)) {
+            let name = attr(&p.path(), "comm").unwrap_or_default();
+            users.push(format!("{name} ({pid})"));
+        }
+    }
+    users
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

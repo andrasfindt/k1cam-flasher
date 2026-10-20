@@ -4,6 +4,7 @@ A small, single-binary GUI to back up, flash and update the Creality K1 camera (
 
 - **Backup & Flash (cloner)**: full read and full flash through the Ingenic USB bootrom cloner protocol, ported from [thingino-dfu](https://github.com/gtxaspec/thingino-dfu) (T31 family only), with read-back verification.
 - **A/B Update (k1cam)**: dump, update the inactive slot, reboot into the trial or cancel it, over the k1cam UVC extension unit protocol (same as `uvcdctl firmware`). On Linux it uses the uvcvideo XU ioctl on `/dev/videoN` (needs access to the video node, e.g. the `video` group); on macOS it uses libusb (untested). Not available on Windows. The tab shows what the connected camera runs (build, kernel commit, slots, boot state) and what the chosen `k1cam.upd` holds (build, commit, kernel, sizes and its os-release, after checking its digests), and whether the camera would take it. `k1cam-flasher FILE.upd` opens the A/B tab with that bundle.
+- **Console**: appears once the camera's USB serial console (CDC-ACM, same USB ids) is detected and connects to it, without switching to it. It doesn't connect while another program has the port open (Linux), so that program keeps its output; while connected, other programs can't open the port until you press *Disconnect*. Type a line and press Enter (an empty line wakes the prompt), *Ctrl-C* stops what runs in the foreground; it reconnects when the camera comes back after a reboot.
 - **Short NOR pins**: built-in instructions for forcing cloner mode (see below).
 
 | Backup & Flash | A/B Update | Short NOR pins |
@@ -35,7 +36,7 @@ ROM's cloner identity remains `a108:c309`. See the
 [firmware USB identity notes](https://github.com/itzexor/k1cam-firmware/blob/k1cam/USB-IDENTITY.md)
 for the rationale and collision checks.
 
-- **Linux**: `sudo cp udev/99-k1cam-flasher.rules /etc/udev/rules.d/ && sudo udevadm control --reload && sudo udevadm trigger`.
+- **Linux**: `sudo cp udev/99-k1cam-flasher.rules /etc/udev/rules.d/ && sudo udevadm control --reload && sudo udevadm trigger`. The console also needs access to `/dev/ttyACM*` (the `dialout` group, `uucp` on Arch).
 - **Windows**: bind WinUSB to `a108:c309` with [Zadig](https://zadig.akeo.ie/) while the camera is in cloner mode.
 - **macOS**: nothing to install.
 
@@ -86,7 +87,7 @@ The same works for `x86_64-unknown-linux-musl` and `armv7-unknown-linux-musleabi
 
 Mixed, per file (SPDX identifiers in the sources, texts in `LICENSES/`):
 
-- **MIT**: the GUI, the command line, the k1cam A/B protocol client, the bundle parser, the USB and Linux device layers (`src/usb.rs`, `src/linux.rs`), udev rule and build files.
+- **MIT**: the GUI, the console, the command line, the k1cam A/B protocol client, the bundle parser, the USB and Linux device layers (`src/usb.rs`, `src/linux.rs`), udev rule and build files.
 - **GPL-2.0-only**: `src/cloner/` and `tools/gen-cloner-data/`, which are derived from [thingino-dfu](https://github.com/gtxaspec/thingino-dfu), and the embedded burner SPL/U-Boot and generated blobs in `src/cloner/data/` (GPL U-Boot, thingino-dfu output).
 - **CC0-1.0** (public domain): the photo `docs/short-nor-pins.jpg`, the synthetic test bundle `tests/data/golden.upd` and this documentation.
 

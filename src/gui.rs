@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: MIT
-//! The GUI: cloner backup and flash, A/B update, and how to force cloner mode.
+//! The GUI: cloner backup and flash, A/B update, the camera's console, and how
+//! to force cloner mode.
 
 use crate::job::{Event, Job};
-use crate::{bundle, cloner, ops, xu};
+use crate::{bundle, cloner, console, ops, xu};
 use eframe::egui;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -14,6 +15,7 @@ use std::time::{Duration, Instant, SystemTime};
 enum Tab {
     Cloner,
     Update,
+    Console,
     Help,
 }
 
@@ -37,6 +39,7 @@ struct App {
     cam_info: Option<Result<String, String>>,
     info_rx: Option<Receiver<Result<String, String>>>,
     info_tried: Instant,
+    console: console::Console,
 }
 
 /// A chosen .upd, read and checked when chosen and again whenever the file changes.
@@ -80,6 +83,7 @@ impl App {
             cam_info: None,
             info_rx: None,
             info_tried: Instant::now(),
+            console: console::Console::new(),
         }
     }
 
@@ -377,6 +381,8 @@ impl eframe::App for App {
             self.last_poll = Instant::now();
         }
         self.poll_camera_info();
+        // Also during jobs: an A/B update's reboot drops and brings back the console.
+        self.console.poll(&ctx);
         ctx.request_repaint_after(Duration::from_millis(250));
 
         egui::Panel::bottom("log").resizable(true).min_size(140.0).show(ui, |ui| {
@@ -398,6 +404,10 @@ impl eframe::App for App {
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.tab, Tab::Cloner, "Backup & Flash (cloner)");
                 ui.selectable_value(&mut self.tab, Tab::Update, "A/B Update (k1cam)");
+                // Appears with the camera's console, ready, but is never switched to.
+                if self.console.seen() {
+                    ui.selectable_value(&mut self.tab, Tab::Console, "Console");
+                }
                 ui.selectable_value(&mut self.tab, Tab::Help, "Short NOR pins");
             });
             ui.separator();
@@ -406,6 +416,7 @@ impl eframe::App for App {
                 Tab::Update => {
                     egui::ScrollArea::vertical().show(ui, |ui| self.update_tab(ui));
                 }
+                Tab::Console => self.console.ui(ui),
                 Tab::Help => self.help_tab(ui),
             }
         });
