@@ -1,0 +1,4 @@
+# Ingenic bootrom / cloner burner
+SUBSYSTEM=="usb", ATTR{idVendor}=="a108", ATTR{idProduct}=="c309", MODE="0666", TAG+="uaccess"
+# k1cam running firmware (A/B update, dump)
+SUBSYSTEM=="usb", ATTR{idVendor}=="1d6b", ATTR{idProduct}=="0110", MODE="0666", TAG+="uaccess"

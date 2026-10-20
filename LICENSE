@@ -1,0 +1,12 @@
+k1cam-flasher is a combination of files under different licenses; see the
+README ("License") and the SPDX-License-Identifier in each source file.
+
+  GPL-2.0-only  src/cloner/**, tools/gen-cloner-data/**   (derived from thingino-dfu)
+  MIT           everything else in src/, udev/, CI, build files
+  CC0-1.0       docs/short-nor-pins.jpg and the README text
+
+Because the program links the GPL-2.0-only cloner code and embeds the GPL
+burner U-Boot, the built binary as a whole is distributed under GPL-2.0-only.
+The MIT and CC0 files remain usable on their own under their own terms.
+
+License texts are in LICENSES/.

@@ -1,0 +1,26 @@
+[package]
+name = "k1cam-flasher"
+version = "0.1.0"
+edition = "2021"
+description = "Small cross-platform GUI to back up, flash and A/B-update the Creality K1 camera (Ingenic T31L) via the cloner and k1cam protocols"
+license = "GPL-2.0-only"
+
+[dependencies]
+rusb = { version = "0.9", features = ["vendored"] }
+eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts", "x11", "wayland"] }
+egui_extras = { version = "0.37", features = ["image"] }
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
+sha2 = "0.10"
+crc32fast = "1"
+rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "async-std"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
