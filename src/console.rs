@@ -7,7 +7,7 @@ use eframe::egui;
 use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{channel, Receiver, TryRecvError};
+use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -164,17 +164,65 @@ impl Term {
     }
 }
 
+enum Msg {
+    Opened,
+    Data(Vec<u8>),
+    Failed(String),
+}
+
+/// A connection, run by a thread of its own: it opens the port, reads and
+/// writes it, and closes it. A device that stops answering can hold an open or
+/// a close for seconds, which must not freeze the window.
 struct Conn {
     name: String,
-    port: Box<dyn serialport::SerialPort>,
-    rx: Receiver<Vec<u8>>,
+    out: Sender<Vec<u8>>,
+    rx: Receiver<Msg>,
     stop: Arc<AtomicBool>,
+    /// The port is open (until then, it is being opened).
+    open: bool,
 }
 
 impl Drop for Conn {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
     }
+}
+
+/// The connection thread: what arrives goes to `tx`, what comes from `out` to
+/// the port, until `stop`.
+fn run_port(name: String, out: Receiver<Vec<u8>>, tx: Sender<Msg>, stop: Arc<AtomicBool>, repaint: impl Fn()) {
+    let mut port = match serialport::new(&name, 115200).timeout(Duration::from_millis(50)).open() {
+        Ok(p) => p,
+        Err(e) => {
+            let _ = tx.send(Msg::Failed(format!("{name}: {e}")));
+            repaint();
+            return;
+        }
+    };
+    let _ = tx.send(Msg::Opened);
+    repaint();
+    let mut buf = [0u8; 4096];
+    while !stop.load(Ordering::Relaxed) {
+        for bytes in out.try_iter() {
+            if let Err(e) = port.write_all(&bytes) {
+                let _ = tx.send(Msg::Failed(format!("{name}: {e}")));
+                repaint();
+                return;
+            }
+        }
+        match port.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                if tx.send(Msg::Data(buf[..n].to_vec())).is_err() {
+                    break;
+                }
+                repaint();
+            }
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::Interrupted) => {}
+            Err(_) => break,
+        }
+    }
+    repaint();
 }
 
 pub struct Console {
@@ -225,14 +273,23 @@ impl Console {
         self.seen
     }
 
+    pub fn connected(&self) -> bool {
+        self.conn.as_ref().is_some_and(|c| c.open)
+    }
+
     /// Takes in what arrived, and once a second looks for the port and connects
     /// when it should.
     pub fn poll(&mut self, ctx: &egui::Context) {
-        if let Some(c) = &self.conn {
-            let mut closed = false;
+        if let Some(c) = &mut self.conn {
+            let (mut failed, mut closed) = (None, false);
             loop {
                 match c.rx.try_recv() {
-                    Ok(b) => self.term.feed(&b),
+                    Ok(Msg::Data(b)) => self.term.feed(&b),
+                    Ok(Msg::Opened) => {
+                        c.open = true;
+                        self.note = format!("Connected to {}. Other programs can't open it until you disconnect.", c.name);
+                    }
+                    Ok(Msg::Failed(e)) => failed = Some(e),
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => {
                         closed = true;
@@ -240,7 +297,10 @@ impl Console {
                     }
                 }
             }
-            if closed {
+            if let Some(e) = failed {
+                self.note = e;
+                self.conn = None;
+            } else if closed {
                 self.note = format!("{} closed; reconnecting when the camera's console is back", c.name);
                 self.conn = None;
                 self.tried = false;
@@ -278,58 +338,33 @@ impl Console {
     fn connect(&mut self, name: &str, force: bool, ctx: &egui::Context) -> bool {
         #[cfg(target_os = "linux")]
         if !force {
-            let users = crate::linux::tty_users(name);
+            let users = crate::linux::device_users(name);
             if !users.is_empty() {
                 self.note = format!("{name} is open in {}; not connecting so that it keeps its output", users.join(", "));
                 return true;
             }
         }
         let _ = force;
-        let opened = serialport::new(name, 115200).timeout(Duration::from_millis(100)).open().and_then(|p| Ok((p.try_clone()?, p)));
-        let (mut reader, port) = match opened {
-            Ok(pair) => pair,
-            Err(e) => {
-                self.note = format!("{name}: {e}");
-                return false;
-            }
-        };
         let (tx, rx) = channel();
+        let (out, out_rx) = channel();
         let stop = Arc::new(AtomicBool::new(false));
-        let (stop2, ctx) = (stop.clone(), ctx.clone());
-        std::thread::spawn(move || {
-            let mut buf = [0u8; 4096];
-            while !stop2.load(Ordering::Relaxed) {
-                match reader.read(&mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        if tx.send(buf[..n].to_vec()).is_err() {
-                            break;
-                        }
-                        ctx.request_repaint();
-                    }
-                    Err(e) if matches!(e.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::Interrupted) => {}
-                    Err(_) => break,
-                }
-            }
-            ctx.request_repaint();
-        });
-        self.note = format!("Connected to {name}. Other programs can't open it until you disconnect.");
-        self.conn = Some(Conn { name: name.into(), port, rx, stop });
+        let (name2, stop2, ctx) = (name.to_string(), stop.clone(), ctx.clone());
+        std::thread::spawn(move || run_port(name2, out_rx, tx, stop2, || ctx.request_repaint()));
+        self.note = format!("Connecting to {name}…");
+        self.conn = Some(Conn { name: name.into(), out, rx, stop, open: false });
         false
     }
 
     fn send(&mut self, bytes: &[u8]) {
-        if let Some(c) = &mut self.conn {
-            if let Err(e) = c.port.write_all(bytes) {
-                self.note = format!("{}: {e}", c.name);
-            }
+        if let Some(c) = &self.conn {
+            let _ = c.out.send(bytes.to_vec());
         }
     }
 
     pub fn ui(&mut self, ui: &mut egui::Ui) {
-        let connected = self.conn.is_some();
+        let connected = self.connected();
         ui.horizontal(|ui| {
-            if connected {
+            if self.conn.is_some() {
                 if ui.button("Disconnect").clicked() {
                     self.auto = false;
                     self.conn = None;
@@ -352,7 +387,14 @@ impl Console {
                 ui.ctx().copy_text(self.term.text());
             }
         });
-        ui.label(&self.note);
+        let color = if connected {
+            crate::gui::ok_color(ui)
+        } else if self.conn.is_some() || self.port.is_some() {
+            crate::gui::warn_color(ui)
+        } else {
+            crate::gui::weak_color(ui)
+        };
+        crate::gui::status(ui, color, self.note.as_str());
         let row = ui.text_style_height(&egui::TextStyle::Monospace);
         let input = ui.spacing().interact_size.y + ui.spacing().item_spacing.y * 2.0;
         egui::ScrollArea::both()
@@ -426,6 +468,36 @@ mod tests {
         assert_eq!(shown(&[b"\xff!"]), "\u{fffd}!");
         // `clear`
         assert_eq!(shown(&[b"old\r\n\x1b[H\x1b[2Jnew"]), "new");
+    }
+
+    /// The connection thread on a pseudo-terminal: it opens it, passes data
+    /// both ways, and lets go when told to stop.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn connection_thread() {
+        use std::os::fd::{FromRawFd, OwnedFd};
+        let (mut master, mut slave) = (0, 0);
+        assert_eq!(unsafe { libc::openpty(&mut master, &mut slave, std::ptr::null_mut(), std::ptr::null(), std::ptr::null()) }, 0);
+        let name = std::fs::read_link(format!("/proc/self/fd/{slave}")).unwrap().to_string_lossy().into_owned();
+        let mut master = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(master) });
+        let (tx, rx) = channel();
+        let (out, out_rx) = channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop2 = stop.clone();
+        let t = std::thread::spawn(move || run_port(name, out_rx, tx, stop2, || {}));
+        assert!(matches!(rx.recv_timeout(Duration::from_secs(5)), Ok(Msg::Opened)));
+        master.write_all(b"# ").unwrap();
+        match rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(Msg::Data(d)) => assert_eq!(d, b"# "),
+            _ => panic!("no data from the port"),
+        }
+        out.send(b"ls\r".to_vec()).unwrap();
+        let mut got = [0u8; 3];
+        master.read_exact(&mut got).unwrap();
+        assert_eq!(&got, b"ls\r");
+        stop.store(true, Ordering::Relaxed);
+        t.join().unwrap();
+        unsafe { libc::close(slave) };
     }
 
     #[test]

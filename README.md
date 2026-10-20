@@ -3,13 +3,16 @@
 A small, single-binary GUI to back up, flash and update the Creality K1 camera (Ingenic T31L, 8 MiB SPI NOR) on Linux, Windows and macOS, and the same operations as a command line, which also builds as a small static binary for the Linux boards a camera gets plugged into (see [Command line](#command-line) and [Static builds](#static-builds)).
 
 - **Backup & Flash (cloner)**: full read and full flash through the Ingenic USB bootrom cloner protocol, ported from [thingino-dfu](https://github.com/gtxaspec/thingino-dfu) (T31 family only), with read-back verification.
-- **A/B Update (k1cam)**: dump, update the inactive slot, reboot into the trial or cancel it, over the k1cam UVC extension unit protocol (same as `uvcdctl firmware`). On Linux it uses the uvcvideo XU ioctl on `/dev/videoN` (needs access to the video node, e.g. the `video` group); on macOS it uses libusb (untested). Not available on Windows. The tab shows what the connected camera runs (build, kernel commit, slots, boot state) and what the chosen `k1cam.upd` holds (build, commit, kernel, sizes and its os-release, after checking its digests), and whether the camera would take it. `k1cam-flasher FILE.upd` opens the A/B tab with that bundle.
+- **A/B Update (k1cam)**: dump, update the inactive slot, reboot into the trial or cancel it, over the k1cam UVC extension unit protocol (same as `uvcdctl firmware`). On Linux it uses the uvcvideo XU ioctl on `/dev/videoN` (needs access to the video node, e.g. the `video` group); on macOS it uses libusb (untested). Not available on Windows. The tab shows what the connected camera runs (build, kernel commit, slots, boot state) next to what the chosen `k1cam.upd` holds (build, commit, kernel, sizes against the slot sizes, and its os-release, after checking its digests), and whether the camera would take it. `k1cam-flasher FILE.upd` opens the A/B tab with that bundle.
+- **Tuning** (Linux): the camera's picture, live (MJPEG at a size and rate you choose), beside its image controls: picture, exposure, white balance, noise, view and encoder settings, as `uvcdctl` names them. The camera keeps every change itself; a control that differs from its default stands out, and clicking its name puts the default back. *Snapshot* saves the frame on screen as the camera sent it (JPEG). The preview runs only while the tab is shown, and *Pause* frees the video for other programs.
 - **Console**: appears once the camera's USB serial console (CDC-ACM, same USB ids) is detected and connects to it, without switching to it. It doesn't connect while another program has the port open (Linux), so that program keeps its output; while connected, other programs can't open the port until you press *Disconnect*. Type a line and press Enter (an empty line wakes the prompt), *Ctrl-C* stops what runs in the foreground; it reconnects when the camera comes back after a reboot.
-- **Short NOR pins**: built-in instructions for forcing cloner mode (see below).
+- **Help** (the *?* tab): forcing cloner mode (see below), drivers and permissions.
 
-| Backup & Flash | A/B Update | Short NOR pins |
+A dot on each tab shows whether its device is attached. Dropping a `k1cam.upd` on the window opens it on the A/B tab, a `.bin` image on Backup & Flash. Closing the window while an operation runs asks first.
+
+| Backup & Flash | A/B Update | Help |
 |---|---|---|
-| ![Backup & Flash tab](docs/screenshot-cloner.png) | ![A/B Update tab](docs/screenshot-update.png) | ![Short NOR pins tab](docs/screenshot-help.png) |
+| ![Backup & Flash tab](docs/screenshot-cloner.png) | ![A/B Update tab](docs/screenshot-update.png) | ![Help tab](docs/screenshot-help.png) |
 
 > Not yet tested against real hardware. Take and check a backup before relying on it.
 
@@ -24,7 +27,7 @@ The bootrom only listens on USB when the SoC cannot boot from the NOR, so you sh
 3. Keep holding while you plug in USB so the camera powers up.
 4. After about a second release the short. `lsusb` shows `a108:c309` and the app shows a green status.
 
-The short only matters at power-up. If the device does not appear, power-cycle and retry. The same text is in the app's *Short NOR pins* tab.
+The short only matters at power-up. If the device does not appear, power-cycle and retry. The same text is in the app's help (the *?* tab).
 
 ## Driver setup
 
@@ -36,15 +39,16 @@ ROM's cloner identity remains `a108:c309`. See the
 [firmware USB identity notes](https://github.com/itzexor/k1cam-firmware/blob/k1cam/USB-IDENTITY.md)
 for the rationale and collision checks.
 
-- **Linux**: `sudo cp udev/99-k1cam-flasher.rules /etc/udev/rules.d/ && sudo udevadm control --reload && sudo udevadm trigger`. The console also needs access to `/dev/ttyACM*` (the `dialout` group, `uucp` on Arch).
+- **Linux**: `sudo cp udev/99-k1cam-flasher.rules /etc/udev/rules.d/ && sudo udevadm control --reload && sudo udevadm trigger`. A/B Update and Tuning need access to the camera's `/dev/video*` node (the `video` group), the console to `/dev/ttyACM*` (the `dialout` group, `uucp` on Arch).
 - **Windows**: bind WinUSB to `a108:c309` with [Zadig](https://zadig.akeo.ie/) while the camera is in cloner mode.
 - **macOS**: nothing to install.
 
 ## Using it
 
-- Backup: *Detect flash chip* checks the link, *Backup flash...* saves the 8 MiB image and shows its SHA-256.
-- Flash: choose `k1cam.bin` (exactly 8 MiB), optionally back up first, tick the confirmation, press *Flash*. This replaces U-Boot and installs the A/B layout once. After that, update with `k1cam.upd` on the A/B tab.
+- Backup: *Detect flash chip* checks the link, *Back up flash...* saves the 8 MiB image and shows its SHA-256. Backups are named for the time in UTC (`k1cam-backup-20261020T073812Z.bin`).
+- Flash: choose `k1cam.bin` (exactly 8 MiB; the tab checks the size when you choose it), optionally back up first, tick the confirmation, press *Flash*. This replaces U-Boot and installs the A/B layout once. After that, update with `k1cam.upd` on the A/B tab.
 - Update: choose `k1cam.upd` and compare it with what the camera runs; the bundle is read again when the file changes on disk, and what is shown is what gets installed. The camera is sent the bundle only, not the release information after it, so cameras on firmware from before that section was added take these files too.
+- Progress shows below the tab with the time taken and, for long steps, the time left; each operation's outcome shows where it was started and in the log.
 
 ## Command line
 
@@ -87,7 +91,7 @@ The same works for `x86_64-unknown-linux-musl` and `armv7-unknown-linux-musleabi
 
 Mixed, per file (SPDX identifiers in the sources, texts in `LICENSES/`):
 
-- **MIT**: the GUI, the console, the command line, the k1cam A/B protocol client, the bundle parser, the USB and Linux device layers (`src/usb.rs`, `src/linux.rs`), udev rule and build files.
+- **MIT**: the GUI, the console, the tuning tab, the command line, the k1cam A/B protocol client, the bundle parser, the USB, Linux and V4L2 device layers (`src/usb.rs`, `src/linux.rs`, `src/v4l2.rs`), udev rule and build files.
 - **GPL-2.0-only**: `src/cloner/` and `tools/gen-cloner-data/`, which are derived from [thingino-dfu](https://github.com/gtxaspec/thingino-dfu), and the embedded burner SPL/U-Boot and generated blobs in `src/cloner/data/` (GPL U-Boot, thingino-dfu output).
 - **CC0-1.0** (public domain): the photo `docs/short-nor-pins.jpg`, the synthetic test bundle `tests/data/golden.upd` and this documentation.
 

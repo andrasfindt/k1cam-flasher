@@ -194,9 +194,31 @@ impl UsbDevice {
     }
 }
 
-/// Other processes that have this tty open, as "name (pid)".
+/// The capture node of an attached camera with one of these ids (its uvcvideo
+/// node with index 0; the other is for metadata), found in sysfs, so a camera
+/// that has stopped answering isn't asked.
 #[cfg(feature = "gui")]
-pub fn tty_users(path: &str) -> Vec<String> {
+pub fn video_node(ids: &[(u16, u16)]) -> Option<PathBuf> {
+    for e in std::fs::read_dir("/sys/class/video4linux").ok()?.flatten() {
+        let dir = e.path();
+        if attr(&dir, "index").as_deref() != Some("0") {
+            continue;
+        }
+        // device is the USB interface; its parent is the device with the ids.
+        let Some(usb) = std::fs::canonicalize(dir.join("device")).ok().and_then(|d| d.parent().map(Path::to_path_buf)) else { continue };
+        let id = |name| attr(&usb, name).and_then(|s| u16::from_str_radix(&s, 16).ok());
+        if let (Some(vid), Some(pid)) = (id("idVendor"), id("idProduct")) {
+            if ids.contains(&(vid, pid)) {
+                return Some(Path::new("/dev").join(e.file_name()));
+            }
+        }
+    }
+    None
+}
+
+/// Other processes that have this device open, as "name (pid)".
+#[cfg(feature = "gui")]
+pub fn device_users(path: &str) -> Vec<String> {
     let Ok(want) = std::fs::canonicalize(path) else { return Vec::new() };
     let me = std::process::id().to_string();
     let mut users = Vec::new();

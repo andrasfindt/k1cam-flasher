@@ -62,6 +62,13 @@ mod v4l {
     }
 }
 
+/// One query to k1cam's Extension Unit through uvcvideo; the image controls
+/// live there too.
+#[cfg(all(target_os = "linux", feature = "gui"))]
+pub fn xu_query(f: &std::fs::File, selector: u8, query: u8, data: &mut [u8]) -> std::io::Result<()> {
+    v4l::query(f, UNIT as u8, selector, query, data)
+}
+
 // Unofficial FOSS VID and "K1" PID; retain the previous firmware identity
 // so an update can cross the change in either direction (including rollback).
 const CAM_VID: u16 = 0xf055;
