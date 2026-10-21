@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! The camera's console on its USB serial port (CDC-ACM, found by the k1cam USB
-//! ids). It is opened as soon as it appears, unless another program has it, and
-//! shown as a line terminal: type a line, Enter sends it.
+//! ids). Connect opens it on request; type a line, Enter sends it.
 
 use eframe::egui;
 use std::collections::VecDeque;
@@ -9,6 +8,7 @@ use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
 use std::sync::Arc;
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 const MAX_LINES: usize = 5000;
@@ -180,6 +180,7 @@ struct Conn {
     stop: Arc<AtomicBool>,
     /// The port is open (until then, it is being opened).
     open: bool,
+    thread: Option<JoinHandle<()>>,
 }
 
 impl Drop for Conn {
@@ -230,11 +231,8 @@ pub struct Console {
     seen: bool,
     port: Option<String>,
     conn: Option<Conn>,
-    /// Connect on its own; off once the user disconnects.
-    auto: bool,
-    /// Auto-connect was tried for this appearance of the port.
-    tried: bool,
-    appeared: Instant,
+    /// The old port must finish closing before another connection or a job.
+    closing: Option<JoinHandle<()>>,
     note: String,
     term: Term,
     input: String,
@@ -257,10 +255,8 @@ impl Console {
             seen: false,
             port: None,
             conn: None,
-            auto: true,
-            tried: false,
-            appeared: Instant::now(),
-            note: String::new(),
+            closing: None,
+            note: "Connect to open the camera's console".into(),
             term: Term::new(),
             input: String::new(),
             history: Vec::new(),
@@ -277,9 +273,25 @@ impl Console {
         self.conn.as_ref().is_some_and(|c| c.open)
     }
 
-    /// Takes in what arrived, and once a second looks for the port and connects
-    /// when it should.
-    pub fn poll(&mut self, ctx: &egui::Context) {
+    pub fn disconnect(&mut self) {
+        if let Some(mut c) = self.conn.take() {
+            c.stop.store(true, Ordering::Relaxed);
+            self.closing = c.thread.take();
+            self.note = "Disconnected".into();
+        }
+    }
+
+    /// The job waits for the serial port to close before it starts.
+    pub fn stop(&mut self) -> Vec<JoinHandle<()>> {
+        self.disconnect();
+        self.closing.take().into_iter().collect()
+    }
+
+    /// Takes in what arrived and discovers ports without opening them.
+    pub fn poll(&mut self) {
+        if self.closing.as_ref().is_some_and(|t| t.is_finished()) {
+            self.closing = None;
+        }
         if let Some(c) = &mut self.conn {
             let (mut failed, mut closed) = (None, false);
             loop {
@@ -298,12 +310,12 @@ impl Console {
                 }
             }
             if let Some(e) = failed {
+                self.disconnect();
                 self.note = e;
-                self.conn = None;
             } else if closed {
-                self.note = format!("{} closed; reconnecting when the camera's console is back", c.name);
-                self.conn = None;
-                self.tried = false;
+                let name = c.name.clone();
+                self.disconnect();
+                self.note = format!("{name} closed; press Connect to reconnect");
             }
         }
         if self.scanned.is_some_and(|t| t.elapsed() < Duration::from_secs(1)) {
@@ -312,47 +324,39 @@ impl Console {
         self.scanned = Some(Instant::now());
         let found = find_port();
         if found != self.port {
-            self.tried = false;
-            self.appeared = Instant::now();
             if self.conn.as_ref().is_some_and(|c| Some(&c.name) != found.as_ref()) {
-                self.conn = None;
+                self.disconnect();
             }
             if found.is_none() && self.seen {
                 self.note = "Waiting for the camera's console".into();
             }
             self.port = found;
         }
-        if let Some(name) = self.port.clone() {
+        if self.port.is_some() {
             self.seen = true;
-            if self.auto && !self.tried && self.conn.is_none() {
-                // Programs that probe new serial ports (ModemManager) hold them
-                // for a moment: keep trying for a while after it appears.
-                let in_use = self.connect(&name, false, ctx);
-                self.tried = !in_use || self.appeared.elapsed() > Duration::from_secs(10);
-            }
         }
     }
 
-    /// Opens the port (unless, without `force`, another program has it: then
-    /// returns true).
-    fn connect(&mut self, name: &str, force: bool, ctx: &egui::Context) -> bool {
+    /// Opens the port on request, once the previous connection has closed.
+    fn connect(&mut self, name: &str, ctx: &egui::Context) {
+        if self.conn.is_some() || self.closing.is_some() {
+            return;
+        }
         #[cfg(target_os = "linux")]
-        if !force {
+        {
             let users = crate::linux::device_users(name);
             if !users.is_empty() {
                 self.note = format!("{name} is open in {}; not connecting so that it keeps its output", users.join(", "));
-                return true;
+                return;
             }
         }
-        let _ = force;
         let (tx, rx) = channel();
         let (out, out_rx) = channel();
         let stop = Arc::new(AtomicBool::new(false));
         let (name2, stop2, ctx) = (name.to_string(), stop.clone(), ctx.clone());
-        std::thread::spawn(move || run_port(name2, out_rx, tx, stop2, || ctx.request_repaint()));
+        let thread = std::thread::spawn(move || run_port(name2, out_rx, tx, stop2, || ctx.request_repaint()));
         self.note = format!("Connecting to {name}…");
-        self.conn = Some(Conn { name: name.into(), out, rx, stop, open: false });
-        false
+        self.conn = Some(Conn { name: name.into(), out, rx, stop, open: false, thread: Some(thread) });
     }
 
     fn send(&mut self, bytes: &[u8]) {
@@ -366,15 +370,11 @@ impl Console {
         ui.horizontal(|ui| {
             if self.conn.is_some() {
                 if ui.button("Disconnect").clicked() {
-                    self.auto = false;
-                    self.conn = None;
-                    self.note = "Disconnected".into();
+                    self.disconnect();
                 }
             } else if let Some(name) = self.port.clone() {
-                if ui.button("Connect").clicked() {
-                    self.auto = true;
-                    self.tried = true;
-                    self.connect(&name, true, ui.ctx());
+                if ui.add_enabled(self.closing.is_none(), egui::Button::new("Connect")).clicked() {
+                    self.connect(&name, ui.ctx());
                 }
             }
             if ui.add_enabled(connected, egui::Button::new("Ctrl-C")).on_hover_text("Stops what runs in the foreground, e.g. logf").clicked() {
@@ -498,6 +498,31 @@ mod tests {
         stop.store(true, Ordering::Relaxed);
         t.join().unwrap();
         unsafe { libc::close(slave) };
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn stopping_the_console_releases_the_port_without_reconnecting() {
+        use std::os::fd::{FromRawFd, OwnedFd};
+        let (mut master, mut slave) = (0, 0);
+        assert_eq!(unsafe { libc::openpty(&mut master, &mut slave, std::ptr::null_mut(), std::ptr::null(), std::ptr::null()) }, 0);
+        let name = std::fs::read_link(format!("/proc/self/fd/{slave}")).unwrap().to_string_lossy().into_owned();
+        let (_master, _slave) = unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
+        let mut console = Console::new();
+        console.port = Some(name.clone());
+        console.scanned = Some(Instant::now());
+        console.poll();
+        assert!(console.conn.is_none());
+        console.connect(&name, &egui::Context::default());
+        assert!(matches!(console.conn.as_ref().unwrap().rx.recv_timeout(Duration::from_secs(5)), Ok(Msg::Opened)));
+        let threads = console.stop();
+        assert_eq!(threads.len(), 1);
+        for t in threads {
+            t.join().unwrap();
+        }
+        let _port = serialport::new(&name, 115200).open().expect("the console must have released its exclusive port");
+        console.poll();
+        assert!(console.conn.is_none(), "a completed job must not reconnect the console");
     }
 
     #[test]

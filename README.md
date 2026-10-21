@@ -4,8 +4,8 @@ A small, single-binary GUI to back up, flash and update the Creality K1 camera (
 
 - **Backup & Flash (cloner)**: full read and full flash through the Ingenic USB bootrom cloner protocol, ported from [thingino-dfu](https://github.com/gtxaspec/thingino-dfu) (T31 family only), with read-back verification.
 - **A/B Update (k1cam)**: dump, update the inactive slot, reboot into the trial or cancel it, over the k1cam UVC extension unit protocol (same as `uvcdctl firmware`). On Linux it uses the uvcvideo XU ioctl on `/dev/videoN` (needs access to the video node, e.g. the `video` group); on macOS it uses libusb (untested). Not available on Windows. The tab shows what the connected camera runs (build, kernel commit, slots, boot state) next to what the chosen `k1cam.upd` holds (build, commit, kernel, sizes against the slot sizes, and its os-release, after checking its digests), and whether the camera would take it. `k1cam-flasher FILE.upd` opens the A/B tab with that bundle.
-- **Tuning** (Linux): the camera's picture, live (MJPEG at a size and rate you choose), beside its image controls: picture, exposure, white balance, noise, view and encoder settings, as `uvcdctl` names them. The camera keeps every change itself; a control that differs from its default stands out, and clicking its name puts the default back. *Snapshot* saves the frame on screen as the camera sent it (JPEG). The preview runs only while the tab is shown, and *Pause* frees the video for other programs.
-- **Console**: appears once the camera's USB serial console (CDC-ACM, same USB ids) is detected and connects to it, without switching to it. It doesn't connect while another program has the port open (Linux), so that program keeps its output; while connected, other programs can't open the port until you press *Disconnect*. Type a line and press Enter (an empty line wakes the prompt), *Ctrl-C* stops what runs in the foreground; it reconnects when the camera comes back after a reboot.
+- **Tuning** (Linux): press *Connect* for the camera's picture, live (MJPEG at a size and rate you choose), beside its image controls: picture, exposure, white balance, noise, view and encoder settings, as `uvcdctl` names them. The camera keeps every change itself; an active control that differs from its default stands out, and clicking its name puts the default back. *Snapshot* saves the frame on screen as the camera sent it (JPEG). The preview runs only while the tab is shown; *Pause* frees the video, and *Disconnect* closes tuning entirely.
+- **Console**: appears once the camera's USB serial console (CDC-ACM, same USB ids) is detected. Press *Connect* to open it. It doesn't connect while another program has the port open (Linux), so that program keeps its output; while connected, other programs can't open the port until you press *Disconnect*. Type a line and press Enter (an empty line wakes the prompt), *Ctrl-C* stops what runs in the foreground. After a reboot or unplug, press *Connect* again.
 - **Help** (the *?* tab): forcing cloner mode (see below), drivers and permissions.
 
 A dot on each tab shows whether its device is attached. Dropping a `k1cam.upd` on the window opens it on the A/B tab, a `.bin` image on Backup & Flash. Closing the window while an operation runs asks first.
@@ -44,6 +44,15 @@ for the rationale and collision checks.
 - **macOS**: nothing to install.
 
 ## Using it
+
+Attaching a camera or opening a tab does not open its console, start video,
+or read its controls. On A/B Update, *Connect* reads the firmware information
+and *Refresh* reads it again. Choosing a valid `.upd` also reads an attached
+camera's information for comparison. Firmware operations disconnect tuning
+and the console and wait for their device access to finish before starting;
+press *Connect* again to use them afterward. While an operation runs, tab
+switching, file loading (including drops), and camera controls are locked;
+Cancel and the log remain available.
 
 - Backup: *Detect flash chip* checks the link, *Back up flash...* saves the 8 MiB image and shows its SHA-256. Backups are named for the time in UTC (`k1cam-backup-20261020T073812Z.bin`).
 - Flash: choose `k1cam.bin` (exactly 8 MiB; the tab checks the size when you choose it), optionally back up first, tick the confirmation, press *Flash*. This replaces U-Boot and installs the A/B layout once. After that, update with `k1cam.upd` on the A/B tab.

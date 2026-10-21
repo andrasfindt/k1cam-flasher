@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, TryRecvError};
 use std::sync::Arc;
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime};
 
 #[derive(PartialEq, Clone, Copy)]
@@ -103,7 +104,7 @@ struct App {
     live_dump: bool,
     cam_info: Option<Result<String, String>>,
     info_rx: Option<Receiver<Result<String, String>>>,
-    info_tried: Instant,
+    info_thread: Option<JoinHandle<()>>,
     console: console::Console,
     tuning: tuning::Tuning,
     /// The window was asked to close while a job ran.
@@ -200,6 +201,10 @@ fn clock(d: Duration) -> String {
     format!("{}:{:02}", s / 60, s % 60)
 }
 
+fn camera_info() -> Result<String, String> {
+    xu::Camera::open().and_then(|mut c| c.info())
+}
+
 /// A titled box for one task on a tab.
 fn card<R>(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
     let r = egui::Frame::group(ui.style())
@@ -260,7 +265,7 @@ impl App {
             live_dump: false,
             cam_info: None,
             info_rx: None,
-            info_tried: Instant::now(),
+            info_thread: None,
             console: console::Console::new(),
             tuning: tuning::Tuning::new(),
             quit_prompt: false,
@@ -280,6 +285,14 @@ impl App {
     where
         F: FnOnce(&Job) -> Result<String, String> + Send + 'static,
     {
+        if self.busy() {
+            return;
+        }
+        let mut threads = self.tuning.stop();
+        threads.extend(self.console.stop());
+        threads.extend(self.info_thread.take());
+        self.info_rx = None;
+        self.cam_info = None;
         let (tx, rx) = channel();
         self.cancel.store(false, Ordering::Relaxed);
         self.results.remove(&op);
@@ -288,7 +301,20 @@ impl App {
         self.job = Some(Running { op, rx, started: now, progress: 0.0, step: now });
         let job = Job::new(tx.clone(), self.cancel.clone());
         std::thread::spawn(move || {
-            let r = f(&job);
+            let r = (|| {
+                if !threads.is_empty() {
+                    job.log("Waiting for live camera access to stop");
+                }
+                let mut failed = false;
+                for thread in threads {
+                    failed |= thread.join().is_err();
+                }
+                if failed {
+                    return Err("a camera thread failed while disconnecting".into());
+                }
+                job.check_cancel()?;
+                f(&job)
+            })();
             let _ = tx.send(Event::Done(r));
         });
     }
@@ -325,9 +351,8 @@ impl App {
         self.cam_info = None;
     }
 
-    /// Keeps the camera's info record current: read when it appears, after each
-    /// job, and again every few seconds while reading fails.
-    fn poll_camera_info(&mut self) {
+    /// A valid bundle may read the camera for comparison; other reads need Connect.
+    fn poll_camera_info(&mut self, read: fn() -> Result<String, String>) {
         if let Some(rx) = &self.info_rx {
             match rx.try_recv() {
                 Ok(r) => {
@@ -340,19 +365,31 @@ impl App {
                 Err(TryRecvError::Disconnected) => self.info_rx = None,
             }
         }
-        let stale = match &self.cam_info {
-            None => true,
-            Some(Err(_)) => self.info_tried.elapsed() > Duration::from_secs(3),
-            Some(Ok(_)) => false,
-        };
-        if self.camera_up && stale && !self.busy() {
-            let (tx, rx) = channel();
-            self.info_rx = Some(rx);
-            self.info_tried = Instant::now();
-            std::thread::spawn(move || {
-                let _ = tx.send(xu::Camera::open().and_then(|mut c| c.info()));
-            });
+        let compare = self.bundle.as_ref().is_some_and(|l| l.bundle.is_ok());
+        if compare && self.cam_info.is_none() {
+            self.read_camera_info(read);
         }
+    }
+
+    fn reading_info(&self) -> bool {
+        self.info_rx.is_some() || self.info_thread.as_ref().is_some_and(|t| !t.is_finished())
+    }
+
+    fn read_camera_info(&mut self, read: fn() -> Result<String, String>) {
+        if !self.camera_up || self.busy() || self.reading_info() {
+            return;
+        }
+        let (tx, rx) = channel();
+        self.cam_info = None;
+        self.info_rx = Some(rx);
+        self.info_thread = Some(std::thread::spawn(move || {
+            let _ = tx.send(read());
+        }));
+    }
+
+    fn load_bundle(&mut self, path: PathBuf) {
+        self.bundle = Some(Loaded::load(path));
+        self.cam_info = None;
     }
 
     /// The last outcome of `op`, if it ran since this tab was set up.
@@ -377,7 +414,7 @@ impl App {
 
     fn choose_bundle(&mut self) {
         if let Some(p) = rfd::FileDialog::new().add_filter("k1cam update", &["upd"]).pick_file() {
-            self.bundle = Some(Loaded::load(p));
+            self.load_bundle(p);
         }
     }
 
@@ -391,7 +428,7 @@ impl App {
         let idle = !self.busy() && self.cloner_up;
         card(ui, "Camera in cloner mode", |ui| {
             if self.cloner_up {
-                status(ui, ok_color(ui), "Connected (USB a108:c309)");
+                status(ui, ok_color(ui), "Attached (USB a108:c309)");
                 if ui
                     .add_enabled(idle, egui::Button::new("Detect flash chip"))
                     .on_hover_text("Checks the link and identifies the flash, without changing it")
@@ -497,12 +534,20 @@ impl App {
             status(ui, weak_color(ui), "No camera running k1cam firmware is attached");
             return;
         }
+        let label = if matches!(self.cam_info, Some(Ok(_))) { "Refresh" } else { "Connect" };
+        if ui.add_enabled(!self.busy() && !self.reading_info(), egui::Button::new(label)).clicked() {
+            self.read_camera_info(camera_info);
+        }
         let info = match &self.cam_info {
             None => {
-                ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.label("Reading the camera's firmware information…");
-                });
+                if self.reading_info() {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("Reading the camera's firmware information…");
+                    });
+                } else {
+                    ui.label("Choose a bundle or connect to read the camera's firmware information.");
+                }
                 return;
             }
             Some(Err(e)) => {
@@ -511,12 +556,7 @@ impl App {
                     warn_color(ui),
                     RichText::new(format!("Attached, but its firmware information could not be read: {e}")).color(warn_color(ui)),
                 );
-                ui.label(
-                    RichText::new(
-                        "Trying again every few seconds. A camera that stays like this may need to be unplugged and plugged back in.",
-                    )
-                    .color(weak_color(ui)),
-                );
+                ui.label(RichText::new("Press Connect to try again.").color(weak_color(ui)));
                 return;
             }
             Some(Ok(info)) => info.clone(),
@@ -776,11 +816,14 @@ impl App {
 
     /// Files dropped on the window: a .upd for the A/B tab, a .bin to flash.
     fn take_dropped(&mut self, ctx: &egui::Context) {
+        if self.busy() {
+            return;
+        }
         let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).collect());
         for p in dropped {
             match p.extension().and_then(|e| e.to_str()) {
                 Some("upd") => {
-                    self.bundle = Some(Loaded::load(p));
+                    self.load_bundle(p);
                     self.tab = Tab::Update;
                 }
                 Some("bin") => {
@@ -918,6 +961,7 @@ impl eframe::App for App {
             self.camera_up = xu::Camera::present();
             if !self.camera_up {
                 self.cam_info = None;
+                self.info_rx = None;
             }
             if !self.tab_chosen {
                 if self.camera_up {
@@ -927,15 +971,16 @@ impl eframe::App for App {
             }
             if let Some(path) = self.bundle.as_ref().filter(|l| l.changed()).map(|l| l.path.clone()) {
                 self.note(Level::Info, format!("{} changed on disk, reloaded", path.display()));
-                self.bundle = Some(Loaded::load(path));
+                self.load_bundle(path);
             }
             self.last_poll = Instant::now();
         }
-        self.poll_camera_info();
-        // Also during jobs: an A/B update's reboot drops and brings back the console.
-        self.console.poll(ctx);
+        self.poll_camera_info(camera_info);
+        self.console.poll();
         let shown = self.tab == Tab::Tuning && !ctx.input(|i| i.viewport().minimized.unwrap_or(false));
-        self.tuning.poll(ctx, shown, self.camera_up);
+        if !self.busy() {
+            self.tuning.poll(ctx, shown, self.camera_up);
+        }
         for l in self.tuning.take_log() {
             match l.strip_prefix("FAILED: ") {
                 Some(e) => self.note(Level::Failed, e),
@@ -951,6 +996,9 @@ impl eframe::App for App {
         self.guard_close(&ctx);
 
         egui::Panel::top("tabs").show(ui, |ui| {
+            if self.busy() {
+                ui.disable();
+            }
             ui.add_space(6.0);
             let (cloner, camera, console) = (self.cloner_up, self.camera_up, self.console.connected());
             let tab = self.tab;
@@ -986,7 +1034,7 @@ impl eframe::App for App {
                         if camera { "A camera running k1cam is attached" } else { "No camera running k1cam" },
                     );
                     item(ui, Tab::Tuning, "Tuning", camera, "The live picture and the camera's image controls");
-                    // Appears with the camera's console, ready, but is never switched to.
+                    // Port discovery makes the tab available without opening the port.
                     if self.console.seen() {
                         item(
                             ui,
@@ -1009,21 +1057,26 @@ impl eframe::App for App {
             ui.add_space(4.0);
         });
         egui::Panel::bottom("log").resizable(true).default_size(120.0).min_size(70.0).show(ui, |ui| self.log_panel(ui));
-        egui::CentralPanel::default().show(ui, |ui| match self.tab {
-            Tab::Cloner => {
-                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| self.cloner_tab(ui));
+        egui::CentralPanel::default().show(ui, |ui| {
+            if self.busy() {
+                ui.disable();
             }
-            Tab::Update => {
-                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| self.update_tab(ui));
-            }
-            Tab::Tuning => self.tuning.ui(ui, self.camera_up),
-            Tab::Console => self.console.ui(ui),
-            Tab::Help => {
-                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| self.help_tab(ui));
+            match self.tab {
+                Tab::Cloner => {
+                    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| self.cloner_tab(ui));
+                }
+                Tab::Update => {
+                    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| self.update_tab(ui));
+                }
+                Tab::Tuning => self.tuning.ui(ui, self.camera_up),
+                Tab::Console => self.console.ui(ui),
+                Tab::Help => {
+                    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| self.help_tab(ui));
+                }
             }
         });
         // Dragging files over the window says what dropping them does.
-        if ctx.input(|i| !i.raw.hovered_files.is_empty()) {
+        if !self.busy() && ctx.input(|i| !i.raw.hovered_files.is_empty()) {
             let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::unique("drop")));
             let rect = ctx.content_rect();
             painter.rect_filled(rect, 0.0, Color32::from_black_alpha(170));
@@ -1034,6 +1087,73 @@ impl eframe::App for App {
                 egui::FontId::proportional(20.0),
                 Color32::WHITE,
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_a_valid_bundle_allows_an_automatic_info_read() {
+        let mut app = App::new();
+        app.camera_up = true;
+        let read = || Ok("build=test\n".into());
+        app.poll_camera_info(read);
+        assert!(app.info_rx.is_none(), "an attachment alone must not query the camera");
+
+        app.load_bundle("tests/data/missing.upd".into());
+        app.poll_camera_info(read);
+        assert!(app.info_rx.is_none(), "a bad bundle must not query the camera");
+
+        app.load_bundle("tests/data/golden.upd".into());
+        assert!(app.bundle.as_ref().unwrap().bundle.is_ok());
+        app.camera_up = false;
+        app.poll_camera_info(read);
+        assert!(app.info_rx.is_none());
+        app.camera_up = true;
+        app.poll_camera_info(read);
+        app.info_thread.take().expect("a valid bundle needs a comparison").join().unwrap();
+        app.poll_camera_info(read);
+        assert_eq!(app.cam_info.as_ref().unwrap().as_deref(), Ok("build=test\n"));
+        assert!(app.info_rx.is_none(), "a completed comparison must not repeat");
+
+        app.cam_info = Some(Err("camera did not answer".into()));
+        app.poll_camera_info(read);
+        assert!(app.info_rx.is_none(), "failed comparisons wait for an explicit retry");
+    }
+
+    #[test]
+    fn jobs_wait_for_camera_access_and_cancel_before_starting() {
+        for cancel in [false, true] {
+            let mut app = App::new();
+            let (release, held) = channel();
+            app.info_thread = Some(std::thread::spawn(move || held.recv().unwrap()));
+            // A valid bundle must not launch a comparison during the job either.
+            app.load_bundle("tests/data/golden.upd".into());
+            app.camera_up = true;
+            let (ran, started) = channel();
+            app.start(Op::Flash, move |_| {
+                ran.send(()).unwrap();
+                Ok("done".into())
+            });
+            assert!(app.busy());
+            app.poll_camera_info(|| panic!("comparison during a firmware job"));
+            assert!(app.info_rx.is_none());
+            let events = &app.job.as_ref().unwrap().rx;
+            assert!(matches!(events.recv_timeout(Duration::from_secs(5)), Ok(Event::Log(_))));
+            assert!(started.try_recv().is_err(), "the operation started before the device closed");
+            app.cancel.store(cancel, Ordering::Relaxed);
+            release.send(()).unwrap();
+            let Ok(Event::Done(result)) = events.recv_timeout(Duration::from_secs(5)) else { panic!("no job result") };
+            if cancel {
+                assert_eq!(result, Err("cancelled".into()));
+                assert!(started.try_recv().is_err());
+            } else {
+                assert_eq!(result, Ok("done".into()));
+                assert!(started.try_recv().is_ok());
+            }
         }
     }
 }
@@ -1063,7 +1183,7 @@ pub fn run(args: &[String]) -> eframe::Result {
                     "--tab=console" => Tab::Console,
                     "--tab=help" => Tab::Help,
                     path if path.ends_with(".upd") => {
-                        app.bundle = Some(Loaded::load(path.into()));
+                        app.load_bundle(path.into());
                         Tab::Update
                     }
                     _ => continue,

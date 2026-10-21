@@ -260,29 +260,40 @@ fn capture(
     };
     let _ = tx.send(StreamMsg::Started(s.width, s.height));
     let mut times: VecDeque<Instant> = VecDeque::new();
+    let mut next = Duration::from_millis(250);
     while !stop.load(Ordering::Relaxed) {
-        match s.frame(Duration::from_millis(250)) {
-            Ok(Some(jpeg)) => {
-                let now = Instant::now();
-                times.push_back(now);
-                while times.front().is_some_and(|t| now - *t > Duration::from_secs(2)) {
-                    times.pop_front();
+        // Every frame counts toward the rate; only the newest is decoded, so
+        // the picture keeps up even where decoding is slower than the camera.
+        let mut jpeg = None;
+        while !stop.load(Ordering::Relaxed) {
+            match s.frame(next) {
+                Ok(Some(f)) => {
+                    times.push_back(Instant::now());
+                    jpeg = Some(f);
+                    next = Duration::ZERO;
                 }
-                let fps = match (times.front(), times.len()) {
-                    (Some(t), n) if n > 1 && now > *t => (n - 1) as f32 / (now - *t).as_secs_f32(),
-                    _ => 0.0,
-                };
-                // A damaged frame is skipped; the next one replaces it.
-                if let Some(image) = decode(&jpeg) {
-                    *latest.lock().unwrap() = Some(Frame { jpeg, image: Arc::new(image), fps });
+                Ok(None) => break,
+                Err(e) => {
+                    let _ = tx.send(StreamMsg::Failed(e));
                     ctx.request_repaint();
+                    return;
                 }
             }
-            Ok(None) => {}
-            Err(e) => {
-                let _ = tx.send(StreamMsg::Failed(e));
-                break;
-            }
+        }
+        next = Duration::from_millis(250);
+        let Some(jpeg) = jpeg else { continue };
+        let now = Instant::now();
+        while times.front().is_some_and(|t| now - *t > Duration::from_secs(2)) {
+            times.pop_front();
+        }
+        let fps = match (times.front(), times.len()) {
+            (Some(t), n) if n > 1 && now > *t => (n - 1) as f32 / (now - *t).as_secs_f32(),
+            _ => 0.0,
+        };
+        // A damaged frame is skipped; the next one replaces it.
+        if let Some(image) = decode(&jpeg) {
+            *latest.lock().unwrap() = Some(Frame { jpeg, image: Arc::new(image), fps });
+            ctx.request_repaint();
         }
     }
     ctx.request_repaint();
@@ -336,7 +347,7 @@ fn factory_reset(ctl: &video::Controls) -> Result<(), String> {
     Ok(())
 }
 
-fn worker(node: PathBuf, rx: Receiver<Req>, tx: Sender<Resp>, ctx: egui::Context) {
+fn worker(node: PathBuf, rx: Receiver<Req>, tx: Sender<Resp>, stop: Arc<AtomicBool>, ctx: egui::Context) {
     let ctl = match video::Controls::open(&node) {
         Ok(c) => c,
         Err(e) => {
@@ -347,6 +358,9 @@ fn worker(node: PathBuf, rx: Receiver<Req>, tx: Sender<Resp>, ctx: egui::Context
     };
     let _ = tx.send(Resp::Sizes(video::frame_sizes(&node)));
     while let Ok(first) = rx.recv() {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
         // Only the newest value of each control matters (a slider sends many).
         let (mut load, mut reset, mut sets) = (false, false, Vec::<(usize, i32)>::new());
         for r in std::iter::once(first).chain(rx.try_iter()) {
@@ -364,13 +378,16 @@ fn worker(node: PathBuf, rx: Receiver<Req>, tx: Sender<Resp>, ctx: egui::Context
             load = true;
         }
         for (i, v) in sets {
+            if stop.load(Ordering::Relaxed) {
+                return;
+            }
             let d = &DEFS[i];
             let r = ctl.write(d.kind, v).and_then(|_| ctl.get(d.kind)).map_err(|e| e.to_string());
             // A refused value is read back, so that what shows is what applies.
             load |= d.governs() || r.is_err();
             let _ = tx.send(Resp::Set(i, v, r));
         }
-        if load {
+        if load && !stop.load(Ordering::Relaxed) {
             let _ = tx.send(Resp::Loaded(load_all(&ctl)));
         }
         ctx.request_repaint();
@@ -380,6 +397,14 @@ fn worker(node: PathBuf, rx: Receiver<Req>, tx: Sender<Resp>, ctx: egui::Context
 struct Worker {
     tx: Sender<Req>,
     rx: Receiver<Resp>,
+    stop: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl Drop for Worker {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
 }
 
 /// The frame on screen.
@@ -391,6 +416,7 @@ struct Shown {
 }
 
 pub struct Tuning {
+    connected: bool,
     node: Option<PathBuf>,
     scanned: Option<Instant>,
     sizes: Vec<(u32, u32)>,
@@ -399,9 +425,8 @@ pub struct Tuning {
     /// The preview should run (while the tab shows and the camera is there).
     live: bool,
     stream: Option<Capture>,
-    /// A stopped capture thread, which must let go of the camera before the
-    /// next one starts.
-    retiring: Option<JoinHandle<()>>,
+    /// Capture and control threads finishing their device access.
+    retiring: Vec<JoinHandle<()>>,
     retry: Instant,
     note: String,
     shown: Option<Shown>,
@@ -419,6 +444,7 @@ const RATES: [u32; 6] = [30, 25, 20, 15, 10, 5];
 impl Tuning {
     pub fn new() -> Self {
         Self {
+            connected: false,
             node: None,
             scanned: None,
             sizes: Vec::new(),
@@ -426,7 +452,7 @@ impl Tuning {
             fps: 30,
             live: true,
             stream: None,
-            retiring: None,
+            retiring: Vec::new(),
             retry: Instant::now(),
             note: String::new(),
             shown: None,
@@ -445,14 +471,16 @@ impl Tuning {
         std::mem::take(&mut self.log)
     }
 
-    /// Follows the camera, and runs the preview only while the tab shows.
+    /// Follows a connection the user requested; an attachment alone does no I/O.
     pub fn poll(&mut self, ctx: &egui::Context, visible: bool, camera_up: bool) {
+        self.retiring.retain(|t| !t.is_finished());
         if !camera_up {
-            if self.node.take().is_some() {
-                self.worker = None;
-                self.loaded = false;
-            }
-        } else if self.node.is_none() && self.scanned.is_none_or(|t| t.elapsed() > Duration::from_secs(1)) {
+            self.disconnect();
+        }
+        if !self.connected {
+            return;
+        }
+        if self.node.is_none() && self.scanned.is_none_or(|t| t.elapsed() > Duration::from_secs(1)) {
             self.scanned = Some(Instant::now());
             self.node = video::node();
         }
@@ -490,7 +518,7 @@ impl Tuning {
             }
         }
         let want = visible && self.live && self.node.is_some();
-        let free = self.retiring.as_ref().is_none_or(|t| t.is_finished());
+        let free = self.retiring.is_empty();
         if want && self.stream.is_none() && free && Instant::now() >= self.retry {
             self.start(ctx);
         } else if !want && self.stream.is_some() {
@@ -506,15 +534,44 @@ impl Tuning {
         let (size, fps, ctx) = (self.size, self.fps, ctx.clone());
         let (stop2, latest2) = (stop.clone(), latest.clone());
         let thread = std::thread::spawn(move || capture(node, size, fps, stop2, latest2, tx, ctx));
-        self.retiring = None;
         self.stream = Some(Capture { stop, latest, rx, thread, size: None });
     }
 
     fn retire(&mut self) {
         if let Some(c) = self.stream.take() {
             c.stop.store(true, Ordering::Relaxed);
-            self.retiring = Some(c.thread);
+            self.retiring.push(c.thread);
         }
+    }
+
+    fn retire_worker(&mut self) {
+        if let Some(mut w) = self.worker.take() {
+            w.stop.store(true, Ordering::Relaxed);
+            if let Some(t) = w.thread.take() {
+                self.retiring.push(t);
+            }
+        }
+    }
+
+    fn disconnect(&mut self) {
+        self.connected = false;
+        self.retire();
+        self.retire_worker();
+        self.node = None;
+        self.scanned = None;
+        self.loaded = false;
+        self.ctl_error = None;
+        self.confirm_reset = false;
+        self.vals.clear();
+        self.note.clear();
+        self.shown = None;
+        self.texture = None;
+    }
+
+    /// Transfer all active threads to the job so it can wait for their devices.
+    pub fn stop(&mut self) -> Vec<JoinHandle<()>> {
+        self.disconnect();
+        std::mem::take(&mut self.retiring)
     }
 
     fn restart(&mut self) {
@@ -523,14 +580,16 @@ impl Tuning {
     }
 
     fn poll_controls(&mut self, ctx: &egui::Context, visible: bool) {
-        if visible && self.worker.is_none() && self.ctl_error.is_none() {
+        if visible && self.worker.is_none() && self.retiring.is_empty() && self.ctl_error.is_none() {
             if let Some(node) = self.node.clone() {
                 let (tx, wrx) = channel();
                 let (wtx, rx) = channel();
+                let stop = Arc::new(AtomicBool::new(false));
+                let stop2 = stop.clone();
                 let ctx = ctx.clone();
-                std::thread::spawn(move || worker(node, wrx, wtx, ctx));
+                let thread = std::thread::spawn(move || worker(node, wrx, wtx, stop2, ctx));
                 let _ = tx.send(Req::Load);
-                self.worker = Some(Worker { tx, rx });
+                self.worker = Some(Worker { tx, rx, stop, thread: Some(thread) });
             }
         }
         let Some(w) = &self.worker else { return };
@@ -574,7 +633,7 @@ impl Tuning {
             }
         }
         if lost {
-            self.worker = None;
+            self.retire_worker();
         }
         if restart {
             self.restart();
@@ -596,6 +655,21 @@ impl Tuning {
             ui.label(RichText::new("No camera running k1cam firmware is attached.").color(ui.visuals().weak_text_color()));
             return;
         }
+        ui.horizontal(|ui| {
+            if self.connected {
+                if ui.button("Disconnect").clicked() {
+                    self.disconnect();
+                }
+            } else if ui.add_enabled(self.retiring.is_empty(), egui::Button::new("Connect")).clicked() {
+                self.connected = true;
+                self.retry = Instant::now();
+            }
+        });
+        if !self.connected {
+            ui.label("Connect to preview the camera and change its image controls.");
+            return;
+        }
+        ui.add_space(4.0);
         // The picture on the left, the controls in a column on the right.
         let full = ui.available_rect_before_wrap();
         let width = (full.width() * 0.42).clamp(300.0, 460.0);
@@ -768,7 +842,8 @@ impl Tuning {
             tip = format!("{}\n\n{tip}", d.help);
         }
         // A changed control stands out, and its name puts the default back.
-        let changed = val.value != val.default;
+        // An inactive control reports what its automatic mode chose, not a choice.
+        let changed = val.value != val.default && !val.inactive;
         let label = if changed { RichText::new(d.label).color(ui.visuals().selection.stroke.color) } else { RichText::new(d.label) };
         let r = ui.add(egui::Label::new(label).sense(if changed && ready && !val.inactive {
             egui::Sense::click()
@@ -816,6 +891,52 @@ impl Tuning {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn attachment_and_tab_selection_do_not_start_tuning() {
+        let mut tuning = Tuning::new();
+        tuning.poll(&egui::Context::default(), true, true);
+        assert!(tuning.node.is_none());
+        assert!(tuning.stream.is_none());
+        assert!(tuning.worker.is_none());
+        tuning.connected = true;
+        tuning.poll(&egui::Context::default(), false, false);
+        tuning.poll(&egui::Context::default(), true, true);
+        assert!(!tuning.connected, "replugging must require another Connect");
+        assert!(tuning.stream.is_none());
+        assert!(tuning.worker.is_none());
+    }
+
+    #[test]
+    fn stopping_tuning_signals_and_returns_every_device_thread() {
+        let mut tuning = Tuning::new();
+        tuning.connected = true;
+        let capture_stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::new(AtomicBool::new(false));
+        let (_, stream_rx) = channel();
+        tuning.stream = Some(Capture {
+            stop: capture_stop.clone(),
+            latest: Arc::new(Mutex::new(None)),
+            rx: stream_rx,
+            thread: std::thread::spawn(|| {}),
+            size: None,
+        });
+        let (tx, _) = channel();
+        let (_, rx) = channel();
+        tuning.worker = Some(Worker { tx, rx, stop: worker_stop.clone(), thread: Some(std::thread::spawn(|| {})) });
+        tuning.retiring.push(std::thread::spawn(|| {}));
+        let threads = tuning.stop();
+        assert!(capture_stop.load(Ordering::Relaxed));
+        assert!(worker_stop.load(Ordering::Relaxed));
+        assert_eq!(threads.len(), 3);
+        for t in threads {
+            t.join().unwrap();
+        }
+        assert!(!tuning.connected);
+        tuning.poll(&egui::Context::default(), true, true);
+        assert!(tuning.stream.is_none());
+        assert!(tuning.worker.is_none());
+    }
 
     #[test]
     fn controls_are_uvcdctls() {
