@@ -45,6 +45,12 @@ pub fn flash(j: &Job, image: &Path, backup_first: bool, verify: bool, reboot: bo
         let path = image.with_file_name(name);
         j.log("Backing up the current flash first");
         j.log(backup(j, &path)?);
+        // The backup started the burner without erase, and the burner does not
+        // re-initialize, so the write needs a fresh cloner-mode session.
+        return Err(format!(
+            "backup saved to {}; now re-enter cloner mode (short the pins, replug the camera) and flash with --no-backup (GUI: untick the backup option)",
+            path.display()
+        ));
     }
     cloner::Cloner::write_flash(j, &data, false)?;
     if verify {

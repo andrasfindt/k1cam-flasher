@@ -37,6 +37,8 @@ const DDR: &[u8] = include_bytes!("data/ddr_t31x.bin");
 const DETECT: &[u8] = include_bytes!("data/detect.bin");
 const MARKER: &[u8] = include_bytes!("data/marker.bin");
 
+const BURNER_RUNNING: &str = "the cloner burner is already running from an earlier detect or backup, and it only erases the flash on the first command after entering cloner mode; re-enter cloner mode (short the pins, replug the camera) and flash before any other cloner command";
+
 const WRITE_CHUNK: usize = 128 * 1024;
 const READ_CHUNK: usize = 1024 * 1024;
 const DESC_ERASE_FLAG: usize = 0xc8 + 0x14;
@@ -328,14 +330,20 @@ impl<'a> Cloner<'a> {
 
     pub fn write_flash(job: &'a Job, image: &[u8], reboot: bool) -> R<()> {
         let mut c = Self::open(job)?;
+        // The burner initializes (and chip-erases, if the descriptor asks) only
+        // on its first VR_FW_HANDSHAKE; later handshakes are no-ops. A burner
+        // left running by a detect or backup would program over the old data.
+        if c.is_firmware_stage()? {
+            return Err(BURNER_RUNNING.into());
+        }
         let chip = c.prepare(true)?;
         if image.len() != chip.size {
             return Err(format!("image is {} bytes but the flash is {}", image.len(), chip.size));
         }
-        c.addr_req(VR_SET_DATA_ADDR, 0x8010_0000)?;
+        c.addr_req_busy(job, VR_SET_DATA_ADDR, 0x8010_0000);
         job.log("Erasing flash (this takes a while)");
         c.wait_erase(job)?;
-        c.addr_req(VR_SET_DATA_LEN, image.len() as u32)?;
+        c.addr_req_busy(job, VR_SET_DATA_LEN, image.len() as u32);
         job.log("Writing");
         let mut off = 0;
         while off < image.len() {
@@ -354,9 +362,18 @@ impl<'a> Cloner<'a> {
         Ok(())
     }
 
+    /// addr_req for the requests that follow the erasing handshake: the burner
+    /// serves no USB while the chip erase runs, so a timeout here means busy,
+    /// not failure (thingino-dfu treats it the same way).
+    fn addr_req_busy(&self, job: &Job, req: u8, v: u32) {
+        if let Err(e) = self.addr_req(req, v) {
+            job.log(format!("{e} (burner busy erasing; continuing)"));
+        }
+    }
+
     fn wait_erase(&self, job: &Job) -> R<()> {
         let t0 = Instant::now();
-        let (min, max) = (Duration::from_secs(5), Duration::from_secs(60));
+        let (min, max) = (Duration::from_secs(5), Duration::from_secs(180));
         let mut last: Option<u32> = None;
         let mut stable = 0;
         while t0.elapsed() < max {
