@@ -6,7 +6,7 @@ use crate::bundle::Bundle;
 use crate::job::Job;
 use crate::{cloner, xu};
 use sha2::{Digest, Sha256};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub const FLASH_SIZE: usize = 8 * 1024 * 1024;
 
@@ -34,7 +34,15 @@ pub fn backup(j: &Job, path: &Path) -> Result<String, String> {
     Ok(format!("{} sha256 {}", path.display(), xu::hex(&Sha256::digest(&data))))
 }
 
-pub fn flash(j: &Job, image: &Path, backup_first: bool, verify: bool, reboot: bool) -> Result<String, String> {
+/// What a flash did. A backup starts the burner without erase, and the burner
+/// erases only for the first command of a cloner-mode session, so with a
+/// backup first, flash stops once the backup is saved.
+pub enum Flashed {
+    Written,
+    BackedUp(PathBuf),
+}
+
+pub fn flash(j: &Job, image: &Path, backup_first: bool, verify: bool, reboot: bool) -> Result<Flashed, String> {
     let data = std::fs::read(image).map_err(|e| format!("{}: {e}", image.display()))?;
     if data.len() != FLASH_SIZE {
         return Err(format!("{} must be exactly 8 MiB (got {} bytes)", image.display(), data.len()));
@@ -47,10 +55,7 @@ pub fn flash(j: &Job, image: &Path, backup_first: bool, verify: bool, reboot: bo
         j.log(backup(j, &path)?);
         // The backup started the burner without erase, and the burner does not
         // re-initialize, so the write needs a fresh cloner-mode session.
-        return Err(format!(
-            "backup saved to {}; now re-enter cloner mode (short the pins, replug the camera) and flash with --no-backup (GUI: untick the backup option)",
-            path.display()
-        ));
+        return Ok(Flashed::BackedUp(path));
     }
     cloner::Cloner::write_flash(j, &data, false)?;
     if verify {
@@ -64,7 +69,7 @@ pub fn flash(j: &Job, image: &Path, backup_first: bool, verify: bool, reboot: bo
     if reboot {
         cloner::Cloner::reboot(j)?;
     }
-    Ok("flashed".into())
+    Ok(Flashed::Written)
 }
 
 pub fn dump(j: &Job, path: &Path, live: bool) -> Result<String, String> {

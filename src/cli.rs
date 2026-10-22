@@ -31,7 +31,11 @@ A camera in cloner mode (bootrom, a108:c309; see the README):
   backup FILE             save the whole flash (8 MiB)
   flash FILE.bin --yes [--no-backup] [--no-verify] [--no-reboot]
                           replace the whole flash: U-Boot, both slots and
-                          the settings (backs it up next to FILE.bin first)
+                          the settings; must be the first command after
+                          entering cloner mode. Without --no-backup it
+                          only saves a backup next to FILE.bin and exits
+                          1: re-enter cloner mode and run it again with
+                          --no-backup
 
   check FILE.upd          verify a bundle and print what it holds
 ";
@@ -108,7 +112,14 @@ pub fn run(args: &[String]) -> Option<i32> {
         },
         "flash" => {
             let (backup, verify, reboot) = (!has("--no-backup"), !has("--no-verify"), !has("--no-reboot"));
-            run_job(move |j| ops::flash(j, &file, backup, verify, reboot))
+            // A backup-only run exits 1: nothing was written.
+            run_job(move |j| match ops::flash(j, &file, backup, verify, reboot)? {
+                ops::Flashed::Written => Ok("flashed".into()),
+                ops::Flashed::BackedUp(p) => Err(format!(
+                    "backup saved to {}; now re-enter cloner mode (short the pins, replug the camera) and flash with --no-backup",
+                    p.display()
+                )),
+            })
         }
         _ => unreachable!(),
     })

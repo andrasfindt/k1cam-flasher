@@ -29,6 +29,8 @@ The bootrom only listens on USB when the SoC cannot boot from the NOR, so you sh
 
 The short only matters at power-up. If the device does not appear, power-cycle and retry. The same text is in the app's help (the *?* tab).
 
+Flash must be the first cloner command after entering cloner mode: the burner erases the flash only then. A backup (`backup`, *Back up flash...*, or the backup step of `flash`) or `detect` uses up the session, so re-enter cloner mode (unplug, short the pins, plug in) before flashing.
+
 ## Driver setup
 
 Running k1cam firmware uses `f055:4b31` (unofficial FOSS community VID,
@@ -54,8 +56,8 @@ press *Connect* again to use them afterward. While an operation runs, tab
 switching, file loading (including drops), and camera controls are locked;
 Cancel and the log remain available.
 
-- Backup: *Detect flash chip* checks the link, *Back up flash...* saves the 8 MiB image and shows its SHA-256. Backups are named for the time in UTC (`k1cam-backup-20261020T073812Z.bin`).
-- Flash: choose `k1cam.bin` (exactly 8 MiB; the tab checks the size when you choose it), optionally back up first, tick the confirmation, press *Flash*. This replaces U-Boot and installs the A/B layout once. After that, update with `k1cam.upd` on the A/B tab.
+- Backup: *Detect flash chip* checks the link, *Back up flash...* saves the 8 MiB image and shows its SHA-256. Backups are named for the time in UTC (`k1cam-backup-20261020T073812Z.bin`). Afterwards the camera has to re-enter cloner mode before it can be flashed.
+- Flash: choose `k1cam.bin` (exactly 8 MiB; the tab checks the size when you choose it), tick the confirmation and press *Flash*, as the first thing after entering cloner mode. With *Back up the current flash first* ticked, *Flash* only saves the backup next to the image and unticks the option; re-enter cloner mode and press *Flash* again to write. After *Detect* or a backup, *Flash* asks for cloner mode again. This replaces U-Boot and installs the A/B layout once. After that, update with `k1cam.upd` on the A/B tab.
 - Update: choose `k1cam.upd` and compare it with what the camera runs; the bundle is read again when the file changes on disk, and what is shown is what gets installed. The camera is sent the bundle only, not the release information after it, so cameras on firmware from before that section was added take these files too.
 - Progress shows below the tab with the time taken and, for long steps, the time left; each operation's outcome shows where it was started and in the log.
 
@@ -74,7 +76,7 @@ k1cam-flasher flash k1cam.bin --yes     # cloner mode: replace the whole flash
 k1cam-flasher check k1cam.upd           # what a bundle holds, no camera needed
 ```
 
-`flash` backs up next to the image, verifies and reboots unless told not to (`--no-backup`, `--no-verify`, `--no-reboot`); `update --no-reboot` only stages. Progress and messages go to stderr, results to stdout; the exit status is 0 on success, 1 on failure and 2 for usage errors. Output files are never overwritten. Ctrl-C stops an operation cleanly (a dump or upload ends its session on the camera); a second Ctrl-C quits at once.
+`flash` verifies and reboots unless told not to (`--no-verify`, `--no-reboot`). Without `--no-backup` it only backs up next to the image and exits 1 with a reminder: re-enter cloner mode and run it again with `--no-backup`, as the first command, to write. `update --no-reboot` only stages. Progress and messages go to stderr, results to stdout; the exit status is 0 on success, 1 on failure and 2 for usage errors. Output files are never overwritten. Ctrl-C stops an operation cleanly (a dump or upload ends its session on the camera); a second Ctrl-C quits at once.
 
 ## Static builds
 

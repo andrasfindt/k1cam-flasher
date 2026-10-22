@@ -28,6 +28,8 @@ enum Op {
     Detect,
     Backup,
     Flash,
+    /// A flash with the backup option: it only saves the backup.
+    FlashBackup,
     Dump,
     Update,
     Reboot,
@@ -40,6 +42,7 @@ impl Op {
             Op::Detect => "Detect flash chip",
             Op::Backup => "Backup",
             Op::Flash => "Flash",
+            Op::FlashBackup => "Back up before flashing",
             Op::Dump => "Dump flash",
             Op::Update => "A/B update",
             Op::Reboot => "Reboot into trial",
@@ -52,7 +55,7 @@ impl Op {
         match self {
             Op::Flash => "Stopping a flash halfway leaves the camera unable to boot until it is flashed again in cloner mode.",
             Op::Update => "The camera keeps booting what it runs now; an install it has already started still finishes.",
-            Op::Backup | Op::Dump => "Stopping now leaves no backup.",
+            Op::Backup | Op::FlashBackup | Op::Dump => "Stopping now leaves no backup.",
             _ => "It stops cleanly.",
         }
     }
@@ -64,8 +67,8 @@ struct Running {
     rx: Receiver<Event>,
     started: Instant,
     progress: f32,
-    /// When the current step began: a flash backs up, writes and verifies,
-    /// each from 0 to 100%.
+    /// When the current step began: a flash writes and verifies, each from 0
+    /// to 100%.
     step: Instant,
 }
 
@@ -201,6 +204,21 @@ fn clock(d: Duration) -> String {
     format!("{}:{:02}", s / 60, s % 60)
 }
 
+/// The cloner's refusal of a burner already running, worded for the GUI.
+const FRESH_SESSION: &str = "Re-enter cloner mode first: the camera was used since it entered cloner mode (Detect or a \
+                             backup), and it only erases the flash for the first command. Short the pins, replug the \
+                             camera, then press Flash before anything else.";
+
+/// Outcomes that tell the user what to do next rather than report a failure:
+/// a backup before flashing, and a flash refused for a used cloner session.
+fn instruction(op: Op, r: &Result<String, String>) -> bool {
+    match (op, r) {
+        (Op::FlashBackup, Ok(_)) => true,
+        (Op::Flash, Err(e)) => e == cloner::BURNER_RUNNING,
+        _ => false,
+    }
+}
+
 fn camera_info() -> Result<String, String> {
     xu::Camera::open().and_then(|mut c| c.info())
 }
@@ -296,6 +314,11 @@ impl App {
         let (tx, rx) = channel();
         self.cancel.store(false, Ordering::Relaxed);
         self.results.remove(&op);
+        // A flash and its backup step share one place for their outcome.
+        if matches!(op, Op::Flash | Op::FlashBackup) {
+            self.results.remove(&Op::Flash);
+            self.results.remove(&Op::FlashBackup);
+        }
         self.note(Level::Start, op.title());
         let now = Instant::now();
         self.job = Some(Running { op, rx, started: now, progress: 0.0, step: now });
@@ -344,6 +367,10 @@ impl App {
         match &r {
             Ok(m) => self.note(Level::Ok, format!("{m}{took}")),
             Err(e) => self.note(Level::Failed, format!("{e}{took}")),
+        }
+        // The write needs a fresh cloner-mode session; the next Flash writes.
+        if op == Op::FlashBackup && r.is_ok() {
+            self.backup_first = false;
         }
         self.results.insert(op, r);
         self.job = None;
@@ -395,6 +422,13 @@ impl App {
     /// The last outcome of `op`, if it ran since this tab was set up.
     fn result(&self, ui: &mut egui::Ui, op: Op) {
         match self.results.get(&op) {
+            Some(r) if instruction(op, r) => {
+                let text = match r {
+                    Ok(m) => m.as_str(),
+                    Err(_) => FRESH_SESSION,
+                };
+                status(ui, warn_color(ui), RichText::new(text).color(warn_color(ui)));
+            }
             Some(Ok(m)) => {
                 status(ui, ok_color(ui), RichText::new(m).color(ok_color(ui)));
             }
@@ -476,7 +510,16 @@ impl App {
                 None => {}
             }
             ui.add_space(4.0);
-            ui.checkbox(&mut self.backup_first, "Back up the current flash first (next to the image)");
+            ui.label(
+                RichText::new(
+                    "Flash must be the first thing done after the camera enters cloner mode. After Detect, a backup or the \
+                     backup option, re-enter cloner mode (short the pins, replug) before pressing Flash.",
+                )
+                .color(weak_color(ui)),
+            );
+            ui.checkbox(&mut self.backup_first, "Back up the current flash first (next to the image)").on_hover_text(
+                "Saves the flash next to the image and stops: the camera then has to re-enter cloner mode before it can be flashed",
+            );
             ui.checkbox(&mut self.verify, "Read back and verify after writing");
             ui.checkbox(&mut self.reboot_after, "Reboot the camera when done");
             ui.checkbox(&mut self.confirm, "I understand this erases the whole flash, U-Boot and the A/B layout included");
@@ -491,8 +534,17 @@ impl App {
                 let image = image.unwrap();
                 let (b, v, r) = (self.backup_first, self.verify, self.reboot_after);
                 self.confirm = false;
-                self.start(Op::Flash, move |j| ops::flash(j, &image, b, v, r));
+                let op = if b { Op::FlashBackup } else { Op::Flash };
+                self.start(op, move |j| match ops::flash(j, &image, b, v, r)? {
+                    ops::Flashed::Written => Ok("flashed".into()),
+                    ops::Flashed::BackedUp(p) => Ok(format!(
+                        "Backup saved to {}. Now re-enter cloner mode (short the pins, replug the camera) and press Flash \
+                         again; the backup option is now off.",
+                        p.display()
+                    )),
+                });
             }
+            self.result(ui, Op::FlashBackup);
             self.result(ui, Op::Flash);
         });
     }
@@ -708,6 +760,12 @@ impl App {
             ui.add_space(4.0);
             ui.label(
                 "If it does not show up, power-cycle and try again: the short only matters at power-up. Don't hold it during the transfer.",
+            );
+            ui.add_space(4.0);
+            ui.label(
+                "Flash first: the camera's burner erases the flash only for the first command after it enters cloner mode. \
+                 After Detect or a backup, re-enter cloner mode (unplug, short the pins, plug in) before flashing; with the \
+                 backup option on, Flash saves the backup and asks for exactly that.",
             );
         };
         // Side by side where there is room for both.
@@ -1155,6 +1213,46 @@ mod tests {
                 assert!(started.try_recv().is_ok());
             }
         }
+    }
+
+    fn finish(app: &mut App) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.busy() {
+            assert!(Instant::now() < deadline, "the job did not finish");
+            std::thread::sleep(Duration::from_millis(10));
+            app.drain();
+        }
+    }
+
+    #[test]
+    fn a_backup_before_flashing_unticks_the_option() {
+        let mut app = App::new();
+        assert!(app.backup_first);
+        app.start(Op::FlashBackup, |_| Ok("saved".into()));
+        finish(&mut app);
+        assert!(!app.backup_first);
+        assert!(matches!(app.results.get(&Op::FlashBackup), Some(Ok(_))));
+        app.start(Op::Flash, |_| Ok("flashed".into()));
+        assert!(!app.results.contains_key(&Op::FlashBackup), "a new flash clears the backup's instruction");
+        finish(&mut app);
+    }
+
+    #[test]
+    fn a_failed_backup_before_flashing_keeps_the_option() {
+        let mut app = App::new();
+        app.start(Op::FlashBackup, |_| Err("read failed".into()));
+        finish(&mut app);
+        assert!(app.backup_first);
+        assert!(matches!(app.results.get(&Op::FlashBackup), Some(Err(_))));
+    }
+
+    #[test]
+    fn instruction_outcomes() {
+        assert!(instruction(Op::FlashBackup, &Ok("saved".into())));
+        assert!(!instruction(Op::FlashBackup, &Err("read failed".into())));
+        assert!(instruction(Op::Flash, &Err(cloner::BURNER_RUNNING.into())));
+        assert!(!instruction(Op::Flash, &Err("other".into())));
+        assert!(!instruction(Op::Backup, &Ok("saved".into())));
     }
 }
 

@@ -37,7 +37,7 @@ const DDR: &[u8] = include_bytes!("data/ddr_t31x.bin");
 const DETECT: &[u8] = include_bytes!("data/detect.bin");
 const MARKER: &[u8] = include_bytes!("data/marker.bin");
 
-const BURNER_RUNNING: &str = "the cloner burner is already running from an earlier detect or backup, and it only erases the flash on the first command after entering cloner mode; re-enter cloner mode (short the pins, replug the camera) and flash before any other cloner command";
+pub const BURNER_RUNNING: &str = "the cloner burner is already running from an earlier detect or backup, and it only erases the flash on the first command after entering cloner mode; re-enter cloner mode (short the pins, replug the camera) and flash before any other cloner command";
 
 const WRITE_CHUNK: usize = 128 * 1024;
 const READ_CHUNK: usize = 1024 * 1024;
